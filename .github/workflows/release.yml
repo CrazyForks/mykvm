@@ -102,23 +102,44 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
+          # Release notes should read like product notes, not a commit/CI dump.
+          # Prefer the curated "## [Unreleased]" section of CHANGELOG.md; fall
+          # back to commit subjects with plumbing (ci/chore/build/docs/test/...)
+          # filtered out and conventional-commit prefixes stripped.
+          notes_body=""
+          if [[ -f CHANGELOG.md ]]; then
+            notes_body="$(awk '
+              /^##[[:space:]]+\[?[Uu]nreleased\]?/ {grab=1; next}
+              grab && /^##[[:space:]]/ {exit}
+              grab {print}
+            ' CHANGELOG.md)"
+          fi
+
+          if [[ -z "$(printf '%s' "$notes_body" | tr -d '[:space:]')" ]]; then
+            if [[ -z "$latest_tag" ]]; then
+              notes_body="$(git log --pretty=format:'%s')"
+            else
+              notes_body="$(git log "$latest_tag"..HEAD --pretty=format:'%s')"
+            fi
+            notes_body="$(printf '%s\n' "$notes_body" \
+              | grep -Ev '^Merge ' \
+              | grep -Ev '^(ci|chore|build|docs|test|style|refactor)(\(.+\))?!?:' \
+              | grep -Ev '^[a-zA-Z]+\(ci\)!?:' \
+              | sed -E 's/^[a-zA-Z]+(\([^)]*\))?!?:[[:space:]]*//' \
+              | sed -E 's/^/- /' || true)"
+          fi
+
           {
             echo "release_notes<<EOF"
-            echo "Automated MyKVM release from commit:"
+            echo "## What's new"
             echo ""
-            echo "- $subject"
+            echo "$notes_body"
             echo ""
-            echo "Downloads:"
+            echo "## Downloads"
+            echo ""
             echo "- macOS: download the .dmg, then drag MyKVM to Applications. The .app.tar.gz file is for automatic updates only."
             echo "- Windows: download the .exe or .msi installer."
             echo "- Linux: download the AppImage, .deb, or .rpm package."
-            echo ""
-            echo "Changes since ${latest_tag:-project start}:"
-            if [[ -z "$latest_tag" ]]; then
-              git log --pretty=format:'- %s'
-            else
-              git log "$latest_tag"..HEAD --pretty=format:'- %s'
-            fi
             echo ""
             echo "EOF"
           } >> "$GITHUB_OUTPUT"
