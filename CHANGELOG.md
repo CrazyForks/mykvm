@@ -10,6 +10,17 @@ release will reuse them).
 
 ### Added
 
+- Update indicator in the title bar: a download icon appears next to "MyKVM" when a newer version is available — click it to open the update panel.
+
+### Fixed
+
+- "Latest version" in Settings now shows the latest released version once a check completes, instead of staying blank when you are already up to date.
+- Corrected the clipboard sync description: images are synced too; only file clipboards are unsupported.
+
+## v0.3.4
+
+### Added
+
 - Encrypted QUIC transport for keyboard, mouse, and clipboard traffic (TLS 1.3, pinned to the paired device's certificate).
 - In-app updates: check GitHub Releases and install the latest version without leaving MyKVM.
 - Clipboard image sync — copy a picture on one machine and paste it on the other (text was already supported).

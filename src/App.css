@@ -369,6 +369,39 @@
   line-height: 1.05;
 }
 
+.brand-update-badge {
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  width: 30px;
+  height: 30px;
+  border: 0;
+  border-radius: 8px;
+  background: #2563eb;
+  color: #fff;
+  cursor: pointer;
+  animation: brand-update-pulse 2.2s ease-in-out infinite;
+}
+
+.brand-update-badge:hover {
+  background: #1d4ed8;
+}
+
+.brand-update-badge .runtime-icon {
+  width: 18px;
+  height: 18px;
+}
+
+@keyframes brand-update-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.55);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(37, 99, 235, 0);
+  }
+}
+
 .brand-lockup span:last-child {
   display: block;
   margin-top: 4px;

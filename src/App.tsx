@@ -402,6 +402,15 @@ function App() {
   const isAvailableUpdateDismissed =
     Boolean(availableUpdate) &&
     dismissedUpdateVersion === availableUpdate?.version;
+  // The latest released version: the newer one when an update is available,
+  // otherwise the current build once a check confirms we're up to date.
+  const latestVersionLabel = availableUpdate
+    ? availableUpdate.version
+    : updateStatus === "current"
+      ? APP_VERSION
+      : null;
+  const hasActionableUpdate =
+    Boolean(availableUpdate) && !isAvailableUpdateDismissed;
   const visibleTabs = useMemo(
     () =>
       machineRole === "client"
@@ -508,7 +517,15 @@ function App() {
       startupUpdateCheckStarted.current = true;
       checkForAppUpdate()
         .then((result) => {
-          if (!active || !result.available || !result.update) {
+          if (!active) {
+            return;
+          }
+
+          if (!result.available || !result.update) {
+            // Up to date: the updater returns nothing, so the current build is
+            // the latest release. Record that so "Latest version" can show it.
+            setAvailableUpdate(null);
+            setUpdateStatus("current");
             return;
           }
 
@@ -1217,6 +1234,17 @@ function App() {
               {layout.devices.length} {ui.common.online}
             </span>
           </div>
+          {hasActionableUpdate && availableUpdate ? (
+            <button
+              type="button"
+              className="brand-update-badge"
+              onClick={() => setActiveTab("settings")}
+              title={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
+              aria-label={`${ui.settings.updateAvailable}: v${availableUpdate.version}`}
+            >
+              <DownloadIcon />
+            </button>
+          ) : null}
         </div>
 
         <div className="header-actions">
@@ -1776,7 +1804,7 @@ function App() {
                   <div>
                     <dt>{ui.settings.latestVersion}</dt>
                     <dd>
-                      {availableUpdate ? `v${availableUpdate.version}` : "--"}
+                      {latestVersionLabel ? `v${latestVersionLabel}` : "--"}
                     </dd>
                   </div>
                 </dl>
@@ -2076,6 +2104,21 @@ function PlayIcon() {
   return (
     <svg className="runtime-icon" viewBox="0 0 24 24" aria-hidden="true">
       <path fill="currentColor" d="M7 4.5v15L18.8 12 7 4.5Z" />
+    </svg>
+  );
+}
+
+function DownloadIcon() {
+  return (
+    <svg className="runtime-icon" viewBox="0 0 24 24" aria-hidden="true">
+      <path
+        fill="currentColor"
+        d="M12 3a1 1 0 0 1 1 1v8.59l2.3-2.3a1 1 0 1 1 1.4 1.42l-4 4a1 1 0 0 1-1.4 0l-4-4a1 1 0 1 1 1.4-1.42l2.3 2.3V4a1 1 0 0 1 1-1Z"
+      />
+      <path
+        fill="currentColor"
+        d="M5 18a1 1 0 0 1 1 1v1h12v-1a1 1 0 1 1 2 0v1.2A1.8 1.8 0 0 1 18.2 22H5.8A1.8 1.8 0 0 1 4 20.2V19a1 1 0 0 1 1-1Z"
+      />
     </svg>
   );
 }

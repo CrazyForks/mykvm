@@ -85,7 +85,7 @@ export const TEXT = {
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
       clipboardCopy:
-        "开启后，运行中的设备会通过局域网同步文本剪贴板。图片和文件剪贴板暂不处理。",
+        "开启后，运行中的设备会通过局域网同步文本和图片剪贴板。文件剪贴板暂不处理。",
       clipboardPlaceholder: "读取本机剪贴板，或输入文本写入本机剪贴板。",
       readClipboard: "读取剪贴板",
       writeClipboard: "写入剪贴板",
@@ -262,7 +262,7 @@ export const TEXT = {
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
       clipboardCopy:
-        "When enabled, running devices sync text clipboard over LAN. Image and file clipboards are ignored.",
+        "When enabled, running devices sync text and image clipboards over the LAN. File clipboards are ignored.",
       clipboardPlaceholder:
         "Read local clipboard, or type text to write to local clipboard.",
       readClipboard: "Read Clipboard",
