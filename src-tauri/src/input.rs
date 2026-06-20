@@ -956,6 +956,7 @@ pub fn try_inject_packet_from_source(
     }
 
     if !packet_authorized(layout, &packet) {
+        warn_unauthorized_packet(layout, &packet);
         return true;
     }
 
@@ -1007,6 +1008,47 @@ fn packet_authorized(layout: &LayoutState, packet: &InputPacket) -> bool {
             || (!packet.origin_device_id.trim().is_empty()
                 && controller.id == packet.origin_device_id)
     })
+}
+
+static LAST_UNAUTHORIZED_WARN: OnceLock<Mutex<Instant>> = OnceLock::new();
+
+/// Log (at most once every few seconds, since a single mouse move floods many
+/// packets) why a controller's input was rejected. Without this the packets
+/// were dropped silently while the device still showed "online", which makes a
+/// pairing-credential mismatch impossible to diagnose — exactly the "shows
+/// online but the cursor can't cross" trap.
+fn warn_unauthorized_packet(layout: &LayoutState, packet: &InputPacket) {
+    let reason = if layout.cluster_id.trim().is_empty() || layout.pair_secret.trim().is_empty() {
+        "this device has no pairing configured (empty cluster/secret) — pair it with the controller"
+    } else if packet.cluster_id != layout.cluster_id || packet.pair_secret != layout.pair_secret {
+        "pairing secret/cluster mismatch — controller and this device are not paired with the same credentials; re-pair them (removing/re-adding the device does NOT re-pair)"
+    } else {
+        "controller is not in this device's paired-controllers list (likely a rotated transport key) — re-pair"
+    };
+
+    let cell = LAST_UNAUTHORIZED_WARN
+        .get_or_init(|| Mutex::new(Instant::now() - Duration::from_secs(60)));
+    if let Ok(mut last) = cell.lock() {
+        if last.elapsed() < Duration::from_secs(3) {
+            return;
+        }
+        *last = Instant::now();
+    }
+
+    log::warn!(
+        "rejected input from controller id={} key={}: {}",
+        if packet.origin_device_id.trim().is_empty() {
+            "<none>"
+        } else {
+            packet.origin_device_id.as_str()
+        },
+        if packet.origin_transport_public_key.trim().is_empty() {
+            "<none>"
+        } else {
+            "<set>"
+        },
+        reason
+    );
 }
 
 fn packet_targets_local(layout: &LayoutState, target_device_id: &str, local_peer_id: &str) -> bool {

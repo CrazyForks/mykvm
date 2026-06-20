@@ -572,7 +572,12 @@ impl AppRuntime {
             }
         });
 
-        let transport = quic_transport::start(preferred_port, on_datagram, on_stream)?;
+        let identity_dir = self
+            .config_path
+            .parent()
+            .map(|parent| parent.to_path_buf())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let transport = quic_transport::start(preferred_port, identity_dir, on_datagram, on_stream)?;
         let mut stored = self
             .quic_transport
             .lock()
@@ -1300,6 +1305,35 @@ fn dismiss_pairing_request(state: tauri::State<'_, AppRuntime>) -> Result<Runtim
     Ok(state.runtime_status())
 }
 
+/// Drop this machine's stored pairing trust so it can be paired afresh.
+///
+/// A client only accepts a new pairing handshake while `pairing_required`
+/// (i.e. `paired_controllers` is empty — see `begin_pairing_challenge`), so a
+/// stale pairing leaves it "already paired" with credentials the controller no
+/// longer matches, and there is otherwise no way back without hand-editing
+/// `layout.json`. Clearing the controllers here flips the client back to
+/// "needs pairing" and re-announces, letting the server re-initiate.
+#[tauri::command]
+fn reset_pairing(state: tauri::State<'_, AppRuntime>) -> Result<AppStateSnapshot, String> {
+    let updated_layout = {
+        let mut layout = state
+            .layout
+            .lock()
+            .map_err(|_| "layout state lock poisoned".to_string())?;
+        layout.paired_controllers.clear();
+        layout.clone()
+    };
+    write_layout_to_disk(&state.config_path, &updated_layout)?;
+
+    if let Ok(mut challenge) = state.pairing_challenge.lock() {
+        *challenge = None;
+    }
+
+    restart_runtime_if_running(&state)?;
+
+    Ok(state.snapshot())
+}
+
 #[tauri::command]
 fn open_repository_url() -> Result<(), String> {
     open_external_url(REPOSITORY_URL)
@@ -1745,6 +1779,7 @@ pub fn run() {
             request_lan_pairing,
             confirm_lan_pairing,
             dismiss_pairing_request,
+            reset_pairing,
             restart_as_admin,
             sync_window_chrome,
             minimize_main_window,

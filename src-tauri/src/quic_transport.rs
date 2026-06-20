@@ -1,6 +1,8 @@
 use std::{
     collections::HashMap,
+    fs,
     net::{SocketAddr, ToSocketAddrs},
+    path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
     time::Duration,
@@ -122,9 +124,15 @@ struct PeerKey {
 
 pub fn start(
     preferred_port: u16,
+    identity_dir: PathBuf,
     on_datagram: PacketHandler,
     on_stream: PacketHandler,
 ) -> Result<TransportHandle, String> {
+    // Load (or create-and-persist) this machine's transport identity *before*
+    // spawning the runtime thread so a stable public key is reused across
+    // restarts/updates. A churning key breaks the peer's certificate pinning
+    // and its paired-controllers authorization until both sides re-pair.
+    let identity = load_or_create_identity(&identity_dir)?;
     let (ready_tx, ready_rx) = mpsc::channel();
     let (command_tx, command_rx) = tokio_mpsc::unbounded_channel();
 
@@ -145,6 +153,7 @@ pub fn start(
 
             runtime.block_on(run_transport(
                 preferred_port,
+                identity,
                 command_rx,
                 on_datagram,
                 on_stream,
@@ -171,12 +180,13 @@ struct ReadyTransport {
 
 async fn run_transport(
     preferred_port: u16,
+    identity: TransportIdentity,
     mut commands: tokio_mpsc::UnboundedReceiver<TransportCommand>,
     on_datagram: PacketHandler,
     on_stream: PacketHandler,
     ready_tx: mpsc::Sender<Result<ReadyTransport, String>>,
 ) {
-    let (endpoint, public_key) = match bind_endpoint(preferred_port) {
+    let (endpoint, public_key) = match bind_endpoint(preferred_port, &identity) {
         Ok(bound) => bound,
         Err(error) => {
             let _ = ready_tx.send(Err(error));
@@ -223,14 +233,17 @@ async fn run_transport(
     endpoint.wait_idle().await;
 }
 
-fn bind_endpoint(preferred_port: u16) -> Result<(Endpoint, String), String> {
+fn bind_endpoint(
+    preferred_port: u16,
+    identity: &TransportIdentity,
+) -> Result<(Endpoint, String), String> {
     let mut last_error = None;
 
     for port in candidate_ports(preferred_port) {
-        let (server_config, public_key) = server_config()?;
+        let server_config = server_config(identity)?;
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         match Endpoint::server(server_config, addr) {
-            Ok(endpoint) => return Ok((endpoint, public_key)),
+            Ok(endpoint) => return Ok((endpoint, identity.public_key.clone())),
             Err(error) => last_error = Some(error.to_string()),
         }
     }
@@ -239,6 +252,59 @@ fn bind_endpoint(preferred_port: u16) -> Result<(Endpoint, String), String> {
         "failed to bind QUIC port: {}",
         last_error.unwrap_or_else(|| "no candidate ports available".into())
     ))
+}
+
+/// This machine's persisted QUIC transport identity. The advertised
+/// `public_key` is the base64 of the certificate DER — peers pin it during
+/// discovery, so it MUST stay stable across restarts.
+#[derive(Clone)]
+struct TransportIdentity {
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+    public_key: String,
+}
+
+const QUIC_CERT_FILE: &str = "quic-transport-cert.der";
+const QUIC_KEY_FILE: &str = "quic-transport-key.der";
+
+/// Load the persisted self-signed cert/key, or generate one and persist it on
+/// first run (or when the stored files are missing/corrupt). Without this the
+/// identity was regenerated on every launch, rotating the advertised public
+/// key and breaking the peer's pinned-cert handshake / pairing authorization.
+fn load_or_create_identity(dir: &Path) -> Result<TransportIdentity, String> {
+    let cert_path = dir.join(QUIC_CERT_FILE);
+    let key_path = dir.join(QUIC_KEY_FILE);
+
+    if let (Ok(cert_der), Ok(key_der)) = (fs::read(&cert_path), fs::read(&key_path)) {
+        if !cert_der.is_empty() && !key_der.is_empty() {
+            return Ok(TransportIdentity {
+                public_key: BASE64.encode(&cert_der),
+                cert_der,
+                key_der,
+            });
+        }
+    }
+
+    let generated = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into(), "localhost".into()])
+        .map_err(|error| format!("failed to generate QUIC certificate: {error}"))?;
+    let cert_der = generated.cert.der().to_vec();
+    let key_der = generated.key_pair.serialize_der();
+
+    if let Err(error) = fs::create_dir_all(dir) {
+        log::warn!("failed to create QUIC identity dir {}: {error}", dir.display());
+    }
+    if let Err(error) = fs::write(&cert_path, &cert_der) {
+        log::warn!("failed to persist QUIC certificate: {error}");
+    }
+    if let Err(error) = fs::write(&key_path, &key_der) {
+        log::warn!("failed to persist QUIC key: {error}");
+    }
+
+    Ok(TransportIdentity {
+        public_key: BASE64.encode(&cert_der),
+        cert_der,
+        key_der,
+    })
 }
 
 fn candidate_ports(preferred_port: u16) -> Vec<u16> {
@@ -257,17 +323,14 @@ fn candidate_ports(preferred_port: u16) -> Vec<u16> {
     ports
 }
 
-fn server_config() -> Result<(ServerConfig, String), String> {
-    let cert = rcgen::generate_simple_self_signed(vec![SERVER_NAME.into(), "localhost".into()])
-        .map_err(|error| format!("failed to generate QUIC certificate: {error}"))?;
-    let cert_der = cert.cert.der().clone();
-    let public_key = BASE64.encode(cert_der.as_ref());
-    let key_der = PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
+fn server_config(identity: &TransportIdentity) -> Result<ServerConfig, String> {
+    let cert_der = CertificateDer::from(identity.cert_der.clone());
+    let key_der = PrivatePkcs8KeyDer::from(identity.key_der.clone());
     let mut config = ServerConfig::with_single_cert(vec![cert_der], key_der.into())
         .map_err(|error| format!("failed to build QUIC server config: {error}"))?;
     config.transport = Arc::new(tuned_transport_config());
 
-    Ok((config, public_key))
+    Ok(config)
 }
 
 /// Shared QUIC transport tuning. The keep-alive interval holds connections open
@@ -572,5 +635,24 @@ mod tests {
             protocol_version: PROTOCOL_VERSION + 1,
         };
         assert!(client_config(&peer).is_err());
+    }
+
+    #[test]
+    fn identity_is_stable_across_reloads() {
+        let dir = std::env::temp_dir().join("mykvm-quic-identity-stability-test");
+        let _ = fs::remove_dir_all(&dir);
+
+        let first = load_or_create_identity(&dir).expect("first identity load");
+        let second = load_or_create_identity(&dir).expect("second identity load");
+
+        assert_eq!(
+            first.public_key, second.public_key,
+            "the advertised public key must survive a reload"
+        );
+        assert_eq!(first.cert_der, second.cert_der);
+        assert_eq!(first.key_der, second.key_der);
+        assert!(!first.public_key.is_empty());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
