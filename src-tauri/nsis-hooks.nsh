@@ -11,9 +11,25 @@
   nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { Stop-Service -Name ''MyKVMInputService'' -Force -ErrorAction SilentlyContinue; $deadline=(Get-Date).AddSeconds(12); while (((Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue).Status -ne ''Stopped'') -and ((Get-Date) -lt $deadline)) { Start-Sleep -Milliseconds 250 } }; Get-Process -Name ''mykvm-input-helper'' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue; Start-Sleep -Milliseconds 400"'
 !macroend
 
+!macro MYKVM_FREE_INPUT_HELPER
+  ; The input helper is run by the LocalSystem MyKVMInputService, which a per-user
+  ; (non-elevated) installer cannot stop, so the .exe stays locked and a plain
+  ; overwrite fails with "Error opening file for writing". Windows DOES allow
+  ; RENAMING a running executable, so move the locked file aside to free its path:
+  ; the new helper is then written normally and the service runs it on its next
+  ; (re)start/reboot. The left-over copy is removed on the next update (or reboot).
+  DetailPrint "Freeing input helper for replacement..."
+  Delete /REBOOTOK "$INSTDIR\mykvm-input-helper.exe.old"
+  IfFileExists "$INSTDIR\mykvm-input-helper.exe" 0 +2
+    Rename "$INSTDIR\mykvm-input-helper.exe" "$INSTDIR\mykvm-input-helper.exe.old"
+!macroend
+
 !macro MYKVM_START_INPUT_SERVICE_IF_INSTALLED
-  DetailPrint "Starting MyKVM input service if installed..."
-  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { Start-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue }"'
+  ; Prefer a full restart so the freshly written helper .exe is picked up. If we
+  ; lack rights to stop a LocalSystem service (per-user installer), fall back to
+  ; just ensuring it runs; the new helper then loads on the next reboot.
+  DetailPrint "Restarting MyKVM input service if installed..."
+  nsExec::ExecToLog 'powershell.exe -NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command "$svc=Get-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue; if ($svc) { try { Restart-Service -Name ''MyKVMInputService'' -Force -ErrorAction Stop } catch { Start-Service -Name ''MyKVMInputService'' -ErrorAction SilentlyContinue } }"'
 !macroend
 
 !macro MYKVM_DELETE_INPUT_SERVICE
@@ -23,6 +39,7 @@
 
 !macro NSIS_HOOK_PREINSTALL
   !insertmacro MYKVM_STOP_INPUT_SERVICE
+  !insertmacro MYKVM_FREE_INPUT_HELPER
   !insertmacro MYKVM_CLOSE_RUNNING_INSTANCES
 !macroend
 

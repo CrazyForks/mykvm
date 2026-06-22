@@ -2511,6 +2511,20 @@ fn install_windows_input_service(helper_path: &PathBuf) -> Result<(), String> {
         }
 
         let _service = ServiceHandleGuard(service);
+
+        // Let the logged-in (Authenticated) user stop/start this LocalSystem
+        // service, so the per-user (non-elevated) updater can restart it during
+        // upgrades without a UAC prompt — important for an unattended client.
+        // SYSTEM and Administrators keep full control; AU only gains
+        // start/stop/query. Best-effort: failure just leaves the default DACL.
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let sddl = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWRPWPLORC;;;AU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)";
+        let _ = std::process::Command::new("sc.exe")
+            .args(["sdset", shared_input::INPUT_SERVICE_NAME, sddl])
+            .creation_flags(CREATE_NO_WINDOW)
+            .output();
+
         Ok(())
     }
 }
