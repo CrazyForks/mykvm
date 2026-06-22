@@ -1,0 +1,38 @@
+[package]
+name = "mykvm-input-helper"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.77.2"
+publish = false
+
+# The Windows-only lock-screen input helper. It lives in its own package so it is
+# NEVER a binary of the main `mykvm` app package — otherwise Tauri tries to bundle
+# it into the macOS .app and Linux .deb, which fails because it only exists on
+# Windows. It is built for Windows by scripts/build-tauri-assets.mjs and attached
+# to the Windows installer via `externalBin`.
+[[bin]]
+name = "mykvm-input-helper"
+path = "src/main.rs"
+
+[dependencies]
+mykvm_lib = { path = "..", package = "mykvm" }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-service = "0.8.1"
+windows-sys = { version = "0.61", features = [
+  "Win32_Foundation",
+  "Win32_Security",
+  "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem",
+  "Win32_System_IO",
+  "Win32_System_LibraryLoader",
+  "Win32_System_Memory",
+  "Win32_System_Pipes",
+  "Win32_System_ProcessStatus",
+  "Win32_System_RemoteDesktop",
+  "Win32_System_Services",
+  "Win32_System_StationsAndDesktops",
+  "Win32_System_Threading",
+  "Win32_UI_Input_KeyboardAndMouse",
+  "Win32_UI_WindowsAndMessaging",
+] }
