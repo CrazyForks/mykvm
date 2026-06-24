@@ -45,7 +45,6 @@
 .theme-light .role-status-pill,
 .theme-light .add-device-form input,
 .theme-light .settings-number-input,
-.theme-light .clipboard-textarea,
 .theme-light .role-switcher button,
 .theme-light .segmented-control,
 .theme-light .switch-button {
@@ -1716,6 +1715,29 @@
   gap: 10px;
 }
 
+.diagnostic-card {
+  display: grid;
+  gap: 10px;
+}
+
+.diagnostic-path {
+  overflow-wrap: anywhere;
+}
+
+.diagnostic-note {
+  margin-top: 0 !important;
+}
+
+.diagnostic-note strong {
+  color: #d4d4d8;
+}
+
+.diagnostic-message {
+  margin-top: 0 !important;
+  color: #34d399;
+  font-weight: 700;
+}
+
 .update-status-badge {
   min-height: 26px;
   display: inline-flex;
@@ -1745,36 +1767,6 @@
 
 .update-message.error {
   color: #fca5a5;
-}
-
-.clipboard-card {
-  display: grid;
-  gap: 10px;
-  align-items: start;
-}
-
-.clipboard-action-button {
-  inline-size: 88px;
-  justify-content: center;
-  padding-inline: 0;
-}
-
-.clipboard-textarea {
-  width: 100%;
-  min-height: 104px;
-  resize: vertical;
-  border: 1px solid rgba(63, 63, 70, 0.92);
-  border-radius: 8px;
-  background: #18181b;
-  color: #f4f4f5;
-  padding: 10px;
-  outline: none;
-  font: inherit;
-  line-height: 1.45;
-}
-
-.clipboard-textarea:focus {
-  border-color: #2786ff;
 }
 
 .performance-card {
@@ -2144,8 +2136,7 @@
   .runtime-summary-card,
   .protocol-card,
   .protocol-grid,
-  .connection-add-card,
-  .clipboard-card {
+  .connection-add-card {
     grid-template-columns: 1fr;
   }
 

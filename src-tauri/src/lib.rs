@@ -55,6 +55,7 @@ const CLIPBOARD_MAX_IMAGE_BYTES: usize = 32 * 1024 * 1024;
 // we never echo received content straight back.
 const CLIPBOARD_ECHO_GRACE_MS: u64 = 1200;
 const CLIPBOARD_RETRY_INTERVAL_MS: u64 = 2000;
+const LOG_MAX_FILE_SIZE_BYTES: u128 = 1024 * 1024;
 const QUIT_EXISTING_ARG: &str = "--mykvm-quit-existing";
 const INSTALL_INPUT_SERVICE_ARG: &str = "--install-input-service";
 const UNINSTALL_INPUT_SERVICE_ARG: &str = "--uninstall-input-service";
@@ -312,6 +313,39 @@ struct RuntimeStatus {
 struct AppStateSnapshot {
     layout: LayoutState,
     runtime: RuntimeStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticInfo {
+    report: String,
+    app_version: String,
+    platform: String,
+    role: String,
+    runtime_started: bool,
+    local_name: String,
+    local_ip: String,
+    discovery_port: u16,
+    quic_port: u16,
+    peer_count: usize,
+    known_devices: Vec<DiagnosticDevice>,
+    log_dir: String,
+    config_dir: String,
+    network_hint: String,
+    firewall_hint: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DiagnosticDevice {
+    name: String,
+    host: String,
+    role: String,
+    online: bool,
+    input_ready: bool,
+    discovery_port: u16,
+    quic_port: u16,
+    same_subnet: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,6 +739,15 @@ impl AppRuntime {
         // our own (possibly drifted) `actual_port`, so a peer that landed on a
         // neighbouring port still receives them.
         let broadcast_targets = broadcast_addrs(desired_port);
+        let direct_targets = known_peer_discovery_targets(&layout, desired_port);
+        log::info!(
+            "discovery started desired_port={} actual_port={} quic_port={} broadcast_targets={} directed_targets={}",
+            desired_port,
+            actual_port,
+            quic_transport.port(),
+            broadcast_targets.len(),
+            direct_targets.len()
+        );
         sync_layout_peer_presence(&self.layout, &self.peers);
 
         thread::spawn(move || {
@@ -816,13 +859,13 @@ impl AppRuntime {
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
                                 let reply =
                                     should_reply_to_discovery(&current_layout, &incoming.peer);
-                                log::info!(
+                                log::debug!(
                                     "discovery {} from {} id={} key={} cluster={} pairing_required={} -> reply={}",
                                     incoming.kind,
                                     source,
                                     incoming.peer.id,
                                     if incoming.peer.transport_public_key.is_empty() { "empty" } else { "set" },
-                                    incoming.peer.cluster_id,
+                                    if incoming.peer.cluster_id.is_empty() { "empty" } else { "set" },
                                     incoming.peer.pairing_required,
                                     reply
                                 );
@@ -1033,6 +1076,29 @@ fn read_runtime_status(state: tauri::State<'_, AppRuntime>) -> RuntimeStatus {
 }
 
 #[tauri::command]
+fn read_diagnostic_info(
+    app: AppHandle,
+    state: tauri::State<'_, AppRuntime>,
+) -> Result<DiagnosticInfo, String> {
+    diagnostic_info(&app, state.inner())
+}
+
+#[tauri::command]
+fn open_log_directory(app: AppHandle) -> Result<(), String> {
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log directory: {error}"))?;
+    fs::create_dir_all(&log_dir).map_err(|error| {
+        format!(
+            "failed to create log directory {}: {error}",
+            log_dir.display()
+        )
+    })?;
+    open_external_path(&log_dir)
+}
+
+#[tauri::command]
 fn save_layout(
     layout: LayoutState,
     state: tauri::State<'_, AppRuntime>,
@@ -1235,6 +1301,157 @@ fn ready_transport_status(discovery: &DiscoveryStatus) -> NativeStageStatus {
             discovery.port, discovery.local_peer.quic_port
         ),
     }
+}
+
+fn diagnostic_info(app: &AppHandle, state: &AppRuntime) -> Result<DiagnosticInfo, String> {
+    let snapshot = state.snapshot();
+    let layout = snapshot.layout;
+    let runtime = snapshot.runtime;
+    let local_peer = runtime.discovery.local_peer.clone();
+    let log_dir = app
+        .path()
+        .app_log_dir()
+        .map_err(|error| format!("failed to resolve log directory: {error}"))?;
+    let config_dir = state
+        .config_path
+        .parent()
+        .map(|path| path.to_path_buf())
+        .unwrap_or_else(|| PathBuf::from("."));
+    let known_devices = layout
+        .devices
+        .iter()
+        .filter(|device| device.role != "local")
+        .map(|device| DiagnosticDevice {
+            name: device.name.clone(),
+            host: device.host.clone(),
+            role: device.role.clone(),
+            online: device.online,
+            input_ready: device.input_ready,
+            discovery_port: device.transport_port,
+            quic_port: normalize_quic_port(device.transport_port, device.quic_port),
+            same_subnet: same_ipv4_24_subnet(&local_peer.ip, &device.host),
+        })
+        .collect::<Vec<_>>();
+    let network_hint = diagnostic_network_hint(&known_devices);
+    let firewall_hint = diagnostic_firewall_hint();
+
+    let mut lines = vec![
+        "MyKVM diagnostics".to_string(),
+        format!("version: v{}", env!("CARGO_PKG_VERSION")),
+        format!("platform: {}", current_platform()),
+        format!("role: {}", layout.machine_role),
+        format!(
+            "runtime: {}",
+            if runtime.started {
+                "started"
+            } else {
+                "stopped"
+            }
+        ),
+        format!("local: {} / {}", local_peer.name, local_peer.ip),
+        format!(
+            "ports: discovery UDP {}, QUIC {}",
+            runtime.discovery.port, local_peer.quic_port
+        ),
+        format!("discovery peers: {}", runtime.discovery.peers.len()),
+        format!("paired controllers: {}", layout.paired_controllers.len()),
+        format!("privilege: {}", runtime.privilege.detail),
+        format!("input service: {}", runtime.input_service.detail),
+        format!("log dir: {}", log_dir.display()),
+        format!("config dir: {}", config_dir.display()),
+        format!("network hint: {network_hint}"),
+        format!("firewall hint: {firewall_hint}"),
+    ];
+    if known_devices.is_empty() {
+        lines.push("known devices: none".into());
+    } else {
+        lines.push("known devices:".into());
+        for device in &known_devices {
+            let subnet = match device.same_subnet {
+                Some(true) => "same /24",
+                Some(false) => "different /24",
+                None => "subnet unknown",
+            };
+            lines.push(format!(
+                "- {} {} host={} online={} inputReady={} UDP={} QUIC={} {}",
+                device.role,
+                device.name,
+                device.host,
+                device.online,
+                device.input_ready,
+                device.discovery_port,
+                device.quic_port,
+                subnet
+            ));
+        }
+    }
+
+    Ok(DiagnosticInfo {
+        report: lines.join("\n"),
+        app_version: env!("CARGO_PKG_VERSION").into(),
+        platform: current_platform().into(),
+        role: layout.machine_role,
+        runtime_started: runtime.started,
+        local_name: local_peer.name,
+        local_ip: local_peer.ip,
+        discovery_port: runtime.discovery.port,
+        quic_port: local_peer.quic_port,
+        peer_count: runtime.discovery.peers.len(),
+        known_devices,
+        log_dir: log_dir.to_string_lossy().into_owned(),
+        config_dir: config_dir.to_string_lossy().into_owned(),
+        network_hint,
+        firewall_hint,
+    })
+}
+
+fn diagnostic_network_hint(devices: &[DiagnosticDevice]) -> String {
+    if devices.is_empty() {
+        return "No remote devices are saved on this machine yet.".into();
+    }
+
+    let known = devices
+        .iter()
+        .filter_map(|device| device.same_subnet)
+        .collect::<Vec<_>>();
+    if known.iter().any(|same_subnet| !same_subnet) {
+        return "At least one saved peer appears outside this machine's local /24; routing, VLAN, AP isolation, or firewall rules may be involved.".into();
+    }
+    if known.len() == devices.len() && known.iter().all(|same_subnet| *same_subnet) {
+        return "Saved peer IPs appear to be on the same local /24 as this machine.".into();
+    }
+    "Some saved peer hosts are names or non-IPv4 addresses, so subnet matching could not be inferred.".into()
+}
+
+#[cfg(target_os = "windows")]
+fn diagnostic_firewall_hint() -> String {
+    if is_windows_process_elevated().unwrap_or(false) {
+        "Running as administrator; MyKVM attempts to add a Windows Defender Firewall UDP allow rule for this executable at startup.".into()
+    } else {
+        "Running as a standard user; MyKVM cannot add its Windows Defender Firewall rule automatically. If discovery drops, allow MyKVM UDP on Private networks.".into()
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn diagnostic_firewall_hint() -> String {
+    "Check the OS firewall if LAN discovery or QUIC traffic is blocked.".into()
+}
+
+fn same_ipv4_24_subnet(local_ip: &str, host_value: &str) -> Option<bool> {
+    let local = local_ip.parse::<std::net::Ipv4Addr>().ok()?;
+    let remote = ipv4_from_host_value(host_value)?;
+    let local_octets = local.octets();
+    let remote_octets = remote.octets();
+    Some(local_octets[..3] == remote_octets[..3])
+}
+
+fn ipv4_from_host_value(host_value: &str) -> Option<std::net::Ipv4Addr> {
+    host_candidates(host_value)
+        .into_iter()
+        .find_map(|candidate| {
+            let (host, _) = split_host_port(&candidate);
+            host.parse::<std::net::Ipv4Addr>().ok()
+        })
 }
 
 #[tauri::command]
@@ -2052,8 +2269,13 @@ pub fn run() {
             app.handle().plugin(
                 tauri_plugin_log::Builder::default()
                     .level(log::LevelFilter::Info)
+                    .max_file_size(LOG_MAX_FILE_SIZE_BYTES)
+                    .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(5))
                     .build(),
             )?;
+            if let Ok(log_dir) = app.path().app_log_dir() {
+                log::info!("file logging enabled at {}", log_dir.display());
+            }
 
             let config_dir = app
                 .path()
@@ -2121,6 +2343,8 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             load_app_state,
             read_runtime_status,
+            read_diagnostic_info,
+            open_log_directory,
             save_layout,
             start_runtime,
             stop_runtime,
@@ -2292,6 +2516,27 @@ fn open_external_url(url: &str) -> Result<(), String> {
         .spawn()
         .map(|_| ())
         .map_err(|error| format!("failed to open URL: {error}"))
+}
+
+fn open_external_path(path: &PathBuf) -> Result<(), String> {
+    let mut command = if cfg!(target_os = "macos") {
+        let mut command = Command::new("open");
+        command.arg(path);
+        command
+    } else if cfg!(target_os = "windows") {
+        let mut command = Command::new("explorer");
+        command.arg(path);
+        command
+    } else {
+        let mut command = Command::new("xdg-open");
+        command.arg(path);
+        command
+    };
+
+    command
+        .spawn()
+        .map(|_| ())
+        .map_err(|error| format!("failed to open path {}: {error}", path.display()))
 }
 
 fn load_layout_from_disk(path: &PathBuf) -> Option<LayoutState> {
@@ -4855,6 +5100,23 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
     prune_stale_peer_entries(peers, now);
 
     if let Some(existing) = peers.iter_mut().find(|peer| peer.id == next_peer.id) {
+        if existing.input_ready != next_peer.input_ready
+            || existing.pairing_required != next_peer.pairing_required
+            || existing.ip != next_peer.ip
+            || existing.transport_port != next_peer.transport_port
+            || existing.quic_port != next_peer.quic_port
+        {
+            log::info!(
+                "discovery peer updated id={} name={} ip={} discovery_port={} quic_port={} input_ready={} pairing_required={}",
+                next_peer.id,
+                next_peer.name,
+                next_peer.ip,
+                next_peer.transport_port,
+                next_peer.quic_port,
+                next_peer.input_ready,
+                next_peer.pairing_required
+            );
+        }
         *existing = next_peer;
         return;
     }
@@ -4869,6 +5131,16 @@ fn merge_peer_entry(peers: &mut Vec<LanPeer>, next_peer: LanPeer) {
         }
     }
 
+    log::info!(
+        "discovery peer found id={} name={} ip={} discovery_port={} quic_port={} input_ready={} pairing_required={}",
+        next_peer.id,
+        next_peer.name,
+        next_peer.ip,
+        next_peer.transport_port,
+        next_peer.quic_port,
+        next_peer.input_ready,
+        next_peer.pairing_required
+    );
     peers.push(next_peer);
 }
 
@@ -5149,6 +5421,19 @@ fn prune_stale_peers(peers: &Arc<Mutex<Vec<LanPeer>>>) {
 }
 
 fn prune_stale_peer_entries(peers: &mut Vec<LanPeer>, now: u64) {
+    for peer in peers
+        .iter()
+        .filter(|peer| now.saturating_sub(peer.last_seen_ms) > PEER_TTL_MS)
+    {
+        log::info!(
+            "discovery peer stale id={} name={} ip={} last_seen_age_ms={} ttl_ms={}",
+            peer.id,
+            peer.name,
+            peer.ip,
+            now.saturating_sub(peer.last_seen_ms),
+            PEER_TTL_MS
+        );
+    }
     peers.retain(|peer| now.saturating_sub(peer.last_seen_ms) <= PEER_TTL_MS);
 }
 

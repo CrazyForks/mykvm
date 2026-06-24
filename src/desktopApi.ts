@@ -4,6 +4,7 @@ import { RELEASES_URL, REPOSITORY_URL } from './constants'
 import { defaultLayout } from './defaultLayout'
 import type {
   AppStateSnapshot,
+  DiagnosticInfo,
   DiscoveryStatus,
   InputServiceStatus,
   PerformanceSample,
@@ -200,6 +201,38 @@ export async function readRuntimeStatus(): Promise<RuntimeStatus> {
   }
 
   return invoke<RuntimeStatus>('read_runtime_status')
+}
+
+export async function readDiagnosticInfo(): Promise<DiagnosticInfo> {
+  if (!isTauri()) {
+    return {
+      report: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
+      appVersion: '0.1.0',
+      platform: navigator.platform,
+      role: defaultLayout.machineRole,
+      runtimeStarted: browserRuntime.started,
+      localName: browserRuntime.discovery.localPeer.name,
+      localIp: browserRuntime.discovery.localPeer.ip,
+      discoveryPort: browserRuntime.discovery.port,
+      quicPort: browserRuntime.discovery.localPeer.quicPort,
+      peerCount: browserRuntime.discovery.peers.length,
+      knownDevices: [],
+      logDir: '',
+      configDir: '',
+      networkHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
+      firewallHint: 'Desktop diagnostics are available only in the Tauri desktop runtime.',
+    }
+  }
+
+  return invoke<DiagnosticInfo>('read_diagnostic_info')
+}
+
+export async function openLogDirectory(): Promise<void> {
+  if (!isTauri()) {
+    return
+  }
+
+  await invoke('open_log_directory')
 }
 
 export async function stopRuntime(): Promise<RuntimeStatus> {

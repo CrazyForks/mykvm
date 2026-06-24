@@ -20,10 +20,11 @@ import {
   isPortableMode,
   loadAppState,
   minimizeMainWindow,
+  openLogDirectory,
   openRepositoryUrl,
   openUpdateReleasePage,
   probeLanPeer,
-  readClipboardText,
+  readDiagnosticInfo,
   readPerformanceSample,
   readRuntimeStatus,
   relaunchApp,
@@ -54,6 +55,7 @@ import {
 import type { FlattenedScreen, LayoutBounds } from "./layout";
 import type {
   AppStateSnapshot,
+  DiagnosticInfo,
   LanPeer,
   LanPeerScreen,
   PerformanceSample,
@@ -152,7 +154,6 @@ function App() {
   const [isDismissingPairing, setIsDismissingPairing] = useState(false);
   const [isAdminRestartPending, setIsAdminRestartPending] = useState(false);
   const [isAppRelaunchPending, setIsAppRelaunchPending] = useState(false);
-  const [isClipboardPending, setIsClipboardPending] = useState(false);
   const [boardZoom, setBoardZoom] = useState(1);
   const [manualDeviceName, setManualDeviceName] = useState("");
   const [manualDeviceHost, setManualDeviceHost] = useState("");
@@ -162,7 +163,12 @@ function App() {
   const [serverPairingError, setServerPairingError] = useState<string | null>(
     null,
   );
-  const [clipboardText, setClipboardText] = useState("");
+  const [diagnosticInfo, setDiagnosticInfo] =
+    useState<DiagnosticInfo | null>(null);
+  const [diagnosticMessage, setDiagnosticMessage] = useState<string | null>(
+    null,
+  );
+  const [isDiagnosticPending, setIsDiagnosticPending] = useState(false);
   const [performanceSamples, setPerformanceSamples] = useState<
     PerformanceSample[]
   >([]);
@@ -653,6 +659,83 @@ function App() {
     };
   }, [isPerformanceActive]);
 
+  useEffect(() => {
+    if (currentTab !== "settings" || !hasLoadedSnapshot) {
+      return;
+    }
+
+    let active = true;
+    const refresh = () => {
+      readDiagnosticInfo()
+        .then((info) => {
+          if (active) {
+            setDiagnosticInfo(info);
+          }
+        })
+        .catch(() => {
+          // Diagnostics are helpful but not required for the settings screen.
+        });
+    };
+
+    refresh();
+    const intervalId = window.setInterval(refresh, 5000);
+
+    return () => {
+      active = false;
+      window.clearInterval(intervalId);
+    };
+  }, [currentTab, hasLoadedSnapshot]);
+
+  async function refreshDiagnostics() {
+    setIsDiagnosticPending(true);
+    setDiagnosticMessage(null);
+
+    try {
+      setDiagnosticInfo(await readDiagnosticInfo());
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsDiagnosticPending(false);
+    }
+  }
+
+  async function copyDiagnostics() {
+    setIsDiagnosticPending(true);
+    setDiagnosticMessage(null);
+
+    try {
+      const info = diagnosticInfo ?? (await readDiagnosticInfo());
+      setDiagnosticInfo(info);
+      await navigator.clipboard
+        .writeText(info.report)
+        .catch(() => writeClipboardText(info.report));
+      setDiagnosticMessage(ui.settings.diagnosticsCopied);
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.writeClipboard,
+      );
+    } finally {
+      setIsDiagnosticPending(false);
+    }
+  }
+
+  async function handleOpenLogDirectory() {
+    setIsDiagnosticPending(true);
+    setDiagnosticMessage(null);
+
+    try {
+      await openLogDirectory();
+    } catch (error: unknown) {
+      setErrorMessage(
+        error instanceof Error ? error.message : ui.errors.updateRuntime,
+      );
+    } finally {
+      setIsDiagnosticPending(false);
+    }
+  }
+
   async function persistLayout(nextLayout: LayoutState) {
     setIsSaving(true);
     try {
@@ -955,36 +1038,6 @@ function App() {
       quicPort: normalizePort(normalizedPort + 1),
       transportPortMode: "fixed",
     }));
-  }
-
-  async function refreshClipboardText() {
-    setIsClipboardPending(true);
-    setErrorMessage(null);
-
-    try {
-      setClipboardText(await readClipboardText());
-    } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.readClipboard,
-      );
-    } finally {
-      setIsClipboardPending(false);
-    }
-  }
-
-  async function writeClipboard() {
-    setIsClipboardPending(true);
-    setErrorMessage(null);
-
-    try {
-      await writeClipboardText(clipboardText);
-    } catch (error: unknown) {
-      setErrorMessage(
-        error instanceof Error ? error.message : ui.errors.writeClipboard,
-      );
-    } finally {
-      setIsClipboardPending(false);
-    }
   }
 
   async function handleRestartAsAdmin() {
@@ -1896,6 +1949,25 @@ function App() {
                     </button>
                   </div>
                 </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.clipboard}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.clipboardSync ? "active" : ""}
+                      onClick={() => setClipboardSync(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.clipboardSync ? "active" : ""}
+                      onClick={() => setClipboardSync(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
                 {machineRole === "client" ? (
                   <div className="settings-control-row paired-controller-row">
                     <span className="paired-controller-label">
@@ -1920,47 +1992,6 @@ function App() {
                     </button>
                   </div>
                 ) : null}
-              </section>
-
-              <section className="surface-card clipboard-card">
-                <div className="card-title-row">
-                  <h2>{ui.settings.clipboard}</h2>
-                  <button
-                    type="button"
-                    className={`switch-button ${layout.clipboardSync ? "active" : ""}`}
-                    onClick={() => setClipboardSync(!layout.clipboardSync)}
-                  >
-                    {layout.clipboardSync
-                      ? ui.common.enabled
-                      : ui.common.disabled}
-                  </button>
-                </div>
-                <p className="muted-copy">{ui.settings.clipboardCopy}</p>
-                <p className="muted-copy">{runtime.clipboard.detail}</p>
-                <textarea
-                  className="clipboard-textarea"
-                  value={clipboardText}
-                  onChange={(event) => setClipboardText(event.target.value)}
-                  placeholder={ui.settings.clipboardPlaceholder}
-                />
-                <div className="inline-actions">
-                  <button
-                    type="button"
-                    className="secondary-button compact-button clipboard-action-button"
-                    onClick={() => void refreshClipboardText()}
-                    disabled={isClipboardPending}
-                  >
-                    {ui.settings.readClipboard}
-                  </button>
-                  <button
-                    type="button"
-                    className="primary-button compact-button clipboard-action-button"
-                    onClick={() => void writeClipboard()}
-                    disabled={isClipboardPending}
-                  >
-                    {ui.settings.writeClipboard}
-                  </button>
-                </div>
               </section>
 
               <section className="surface-card modifier-card">
@@ -2200,6 +2231,63 @@ function App() {
                     </dd>
                   </div>
                 </dl>
+              </section>
+
+              <section className="surface-card settings-card diagnostic-card">
+                <div className="card-title-row">
+                  <h2>{ui.settings.diagnostics}</h2>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void refreshDiagnostics()}
+                    disabled={isDiagnosticPending}
+                  >
+                    {isDiagnosticPending
+                      ? ui.common.refreshing
+                      : ui.common.refresh}
+                  </button>
+                </div>
+                <p className="muted-copy">{ui.settings.diagnosticsCopy}</p>
+                <dl className="network-meta compact-meta">
+                  <div>
+                    <dt>{ui.settings.peers}</dt>
+                    <dd>{diagnosticInfo?.peerCount ?? lanPeers.length}</dd>
+                  </div>
+                  <div>
+                    <dt>{ui.settings.logDirectory}</dt>
+                    <dd className="diagnostic-path">
+                      {diagnosticInfo?.logDir || "--"}
+                    </dd>
+                  </div>
+                </dl>
+                {diagnosticInfo ? (
+                  <p className="muted-copy diagnostic-note">
+                    {diagnosticInfo.networkHint} {diagnosticInfo.firewallHint}
+                  </p>
+                ) : null}
+                <div className="inline-actions">
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void copyDiagnostics()}
+                    disabled={isDiagnosticPending}
+                  >
+                    {ui.settings.copyDiagnostics}
+                  </button>
+                  <button
+                    type="button"
+                    className="secondary-button compact-button"
+                    onClick={() => void handleOpenLogDirectory()}
+                    disabled={isDiagnosticPending || !isTauri()}
+                  >
+                    {ui.settings.openLogDirectory}
+                  </button>
+                </div>
+                {diagnosticMessage ? (
+                  <p className="muted-copy diagnostic-message">
+                    {diagnosticMessage}
+                  </p>
+                ) : null}
               </section>
             </div>
           </div>
