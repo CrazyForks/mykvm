@@ -112,6 +112,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "当前设备",
       clipboard: "剪贴板同步",
+      fileTransfer: "文件传输",
       modifierTitle: "跨平台改键",
       modifierCopy:
         "本机作为控制端时，发往不同系统对端的修饰键映射（仅 Win↔Mac 跨平台时生效）。默认 Ctrl↔Command 对调，让复制、粘贴、全选等快捷键沿用各自系统习惯。",
@@ -335,6 +336,7 @@ export const TEXT = {
       portPlaceholder: "1024-65535",
       activeDevice: "Active Device",
       clipboard: "Clipboard Sync",
+      fileTransfer: "File Transfer",
       modifierTitle: "Cross-platform Keys",
       modifierCopy:
         "When this machine controls a peer on a different OS, remap modifier keys (only applies across Win↔Mac). The default swaps Ctrl↔Command so copy, paste, and select-all keep each platform's shortcut habits.",

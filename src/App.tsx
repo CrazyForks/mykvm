@@ -220,6 +220,35 @@ function App() {
   }, [fileDragTargetId]);
 
   useEffect(() => {
+    if (!isTauri()) {
+      return;
+    }
+
+    const allowNativeFileDrop = (event: DragEvent) => {
+      event.preventDefault();
+      if (event.type === "dragover" && event.dataTransfer) {
+        const targetDeviceId =
+          snapshotRef.current?.layout.fileTransferEnabled === false
+            ? null
+            : fileTransferTargetIdAtPosition({
+                x: event.clientX,
+                y: event.clientY,
+              });
+        event.dataTransfer.dropEffect =
+          targetDeviceId === null ? "none" : "copy";
+      }
+    };
+
+    window.addEventListener("dragover", allowNativeFileDrop);
+    window.addEventListener("drop", allowNativeFileDrop);
+
+    return () => {
+      window.removeEventListener("dragover", allowNativeFileDrop);
+      window.removeEventListener("drop", allowNativeFileDrop);
+    };
+  }, []);
+
+  useEffect(() => {
     let active = true;
 
     loadAppState()
@@ -777,6 +806,10 @@ function App() {
 
   const sendDroppedFiles = useEffectEvent(
     async (targetDeviceId: string, paths: string[]) => {
+      if (snapshotRef.current?.layout.fileTransferEnabled === false) {
+        return;
+      }
+
       const transferPaths = paths.filter((path) => path.trim().length > 0);
       if (transferPaths.length === 0) {
         return;
@@ -810,6 +843,10 @@ function App() {
     getCurrentWebview()
       .onDragDropEvent((event) => {
         const payload = event.payload as NativeFileDragPayload;
+        if (snapshotRef.current?.layout.fileTransferEnabled === false) {
+          setFileDragTargetId(null);
+          return;
+        }
 
         if (payload.type === "over") {
           setFileDragTargetId(fileTransferTargetIdAtPosition(payload.position));
@@ -1084,6 +1121,13 @@ function App() {
     updateLayout((layoutState) => ({
       ...layoutState,
       clipboardSync,
+    }));
+  }
+
+  function setFileTransferEnabled(fileTransferEnabled: boolean) {
+    updateLayout((layoutState) => ({
+      ...layoutState,
+      fileTransferEnabled,
     }));
   }
 
@@ -1501,6 +1545,14 @@ function App() {
     );
   }
 
+  function renderInfoBanner(message: string) {
+    return (
+      <div className="info-banner" role="status">
+        <span>{message}</span>
+      </div>
+    );
+  }
+
   if (!snapshot || !layout || !runtime || !displayLayout) {
     return (
       <main className={shellClassName}>
@@ -1562,6 +1614,7 @@ function App() {
     : ui.common.stopped;
   const roleLabel = ui.roles[machineRole];
   const lanPeers = runtime.discovery.peers;
+  const fileTransferEnabled = layout.fileTransferEnabled;
   const addedOnlyDevices = displayLayout.devices.filter(
     (device) => !lanPeers.some((peer) => deviceMatchesPeer(device, peer)),
   );
@@ -1572,57 +1625,23 @@ function App() {
       device.inputReady &&
       device.transportPublicKey.trim().length > 0,
   );
-  const clientFileTransferTargets =
-    machineRole === "client"
-      ? layout.pairedControllers.map((controller) => {
-          const peer = lanPeers.find(
-            (candidate) =>
-              candidate.id === controller.id ||
-              (controller.transportPublicKey.trim().length > 0 &&
-                candidate.transportPublicKey === controller.transportPublicKey),
-          );
+  const serverFileTransferTargetIds = new Set(
+    serverFileTransferTargets.map((device) => device.id),
+  );
 
-          return {
-            id: controller.id,
-            name: controller.name || controller.ip || controller.id,
-            meta: peer
-              ? `${peer.ip || peer.host} · ${peer.platform || "peer"}`
-              : controller.ip || controller.host || controller.id,
-            available: Boolean(peer),
-          };
-        })
-      : [];
+  function screenFileTransferTargetId(screen: FlattenedScreen) {
+    if (
+      !fileTransferEnabled ||
+      machineRole !== "server" ||
+      screen.role === "local" ||
+      !screen.online ||
+      !screen.inputReady ||
+      !serverFileTransferTargetIds.has(screen.deviceId)
+    ) {
+      return null;
+    }
 
-  function renderFileTransferDropZone(target: {
-    id: string;
-    name: string;
-    meta: string;
-    available: boolean;
-  }) {
-    const isPending = fileTransferPendingTargetId === target.id;
-    const isHovering = fileDragTargetId === target.id;
-
-    return (
-      <div
-        key={target.id}
-        className={`file-drop-zone ${isHovering ? "drag-over" : ""} ${
-          !target.available ? "disabled" : ""
-        }`}
-        data-file-transfer-target={target.available && !isPending ? target.id : undefined}
-      >
-        <div>
-          <strong>{target.name}</strong>
-          <span>{target.meta}</span>
-        </div>
-        <small>
-          {isPending
-            ? ui.devices.fileTransferSending
-            : target.available
-              ? ui.devices.fileTransferDrop
-              : ui.common.offline}
-        </small>
-      </div>
-    );
+    return screen.deviceId;
   }
 
   function renderAddedDeviceActions(device: Device) {
@@ -1720,6 +1739,7 @@ function App() {
       </header>
 
       {errorMessage ? renderErrorBanner(errorMessage) : null}
+      {fileTransferMessage ? renderInfoBanner(fileTransferMessage) : null}
 
       {machineRole === "server" && currentTab === "layout" ? (
         <section className="workspace-shell">
@@ -1748,6 +1768,12 @@ function App() {
               {screens.map((screen) => {
                 const rect = boardRect(screen);
                 const statusKind = screenStatusKind(screen);
+                const fileTargetId = screenFileTransferTargetId(screen);
+                const isFileTargetHovering =
+                  fileTargetId !== null && fileDragTargetId === fileTargetId;
+                const isFileTargetPending =
+                  fileTargetId !== null &&
+                  fileTransferPendingTargetId === fileTargetId;
 
                 return (
                   <button
@@ -1755,7 +1781,14 @@ function App() {
                     type="button"
                     className={`screen-rect ${layout.selectedScreenId === screen.id ? "selected" : ""} ${
                       dragState?.screenId === screen.id ? "dragging" : ""
-                    } ${statusKind}`}
+                    } ${fileTargetId ? "file-target" : ""} ${
+                      isFileTargetHovering ? "file-drag-over" : ""
+                    } ${isFileTargetPending ? "file-transfer-pending" : ""} ${statusKind}`}
+                    data-file-transfer-target={
+                      fileTargetId && !fileTransferPendingTargetId
+                        ? fileTargetId
+                        : undefined
+                    }
                     style={
                       {
                         left: rect.left,
@@ -1871,36 +1904,6 @@ function App() {
                     : ui.common.add}
                 </button>
               </form>
-            </section>
-
-            <section className="surface-card file-transfer-card">
-              <div className="card-title-row">
-                <div>
-                  <h2>{ui.devices.fileTransferTitle}</h2>
-                  <p className="muted-copy">{ui.devices.fileTransferCopy}</p>
-                </div>
-              </div>
-              <div className="file-drop-grid">
-                {serverFileTransferTargets.length > 0 ? (
-                  serverFileTransferTargets.map((device) =>
-                    renderFileTransferDropZone({
-                      id: device.id,
-                      name: device.name,
-                      meta: `${PLATFORM_LABELS[device.platform]} · ${device.host}`,
-                      available: true,
-                    }),
-                  )
-                ) : (
-                  <p className="muted-copy file-transfer-empty">
-                    {ui.devices.fileTransferUnavailable}
-                  </p>
-                )}
-              </div>
-              {fileTransferMessage ? (
-                <p className="muted-copy file-transfer-message">
-                  {fileTransferMessage}
-                </p>
-              ) : null}
             </section>
 
             <section className="surface-card connection-list-card">
@@ -2159,6 +2162,25 @@ function App() {
                     </button>
                   </div>
                 </div>
+                <div className="settings-control-row">
+                  <span>{ui.settings.fileTransfer}</span>
+                  <div className="segmented-control">
+                    <button
+                      type="button"
+                      className={layout.fileTransferEnabled ? "active" : ""}
+                      onClick={() => setFileTransferEnabled(true)}
+                    >
+                      {ui.common.enabled}
+                    </button>
+                    <button
+                      type="button"
+                      className={!layout.fileTransferEnabled ? "active" : ""}
+                      onClick={() => setFileTransferEnabled(false)}
+                    >
+                      {ui.common.disabled}
+                    </button>
+                  </div>
+                </div>
                 {machineRole === "client" ? (
                   <div className="settings-control-row paired-controller-row">
                     <span className="paired-controller-label">
@@ -2184,29 +2206,6 @@ function App() {
                   </div>
                 ) : null}
               </section>
-
-              {machineRole === "client" ? (
-                <section className="surface-card file-transfer-card">
-                  <div>
-                    <h2>{ui.devices.fileTransferTitle}</h2>
-                    <p className="muted-copy">{ui.devices.fileTransferCopy}</p>
-                  </div>
-                  <div className="file-drop-grid">
-                    {clientFileTransferTargets.length > 0 ? (
-                      clientFileTransferTargets.map(renderFileTransferDropZone)
-                    ) : (
-                      <p className="muted-copy file-transfer-empty">
-                        {ui.settings.notPaired}
-                      </p>
-                    )}
-                  </div>
-                  {fileTransferMessage ? (
-                    <p className="muted-copy file-transfer-message">
-                      {fileTransferMessage}
-                    </p>
-                  ) : null}
-                </section>
-              ) : null}
 
               <section className="surface-card modifier-card">
                 <div className="card-title-row">

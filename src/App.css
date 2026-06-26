@@ -209,35 +209,6 @@
   background: #eff6ff;
 }
 
-.theme-light .file-drop-zone {
-  border-color: #c8d2e3;
-  background: #f6f8fc;
-}
-
-.theme-light .file-drop-zone.drag-over {
-  border-color: #1f7af2;
-  background: #e7f0ff;
-  box-shadow: inset 0 0 0 1px rgba(31, 122, 242, 0.24);
-}
-
-.theme-light .file-drop-zone.disabled {
-  background: #f1f4f8;
-}
-
-.theme-light .file-drop-zone strong {
-  color: #172033;
-}
-
-.theme-light .file-drop-zone span,
-.theme-light .file-transfer-empty,
-.theme-light .file-transfer-message {
-  color: #5f6b7d;
-}
-
-.theme-light .file-drop-zone small {
-  color: #1d5fd0;
-}
-
 .theme-light .tag-pill {
   background: #eef2f8;
   color: #4b5568;
@@ -966,6 +937,23 @@
   transform: none;
 }
 
+.screen-rect.file-target {
+  cursor: copy;
+}
+
+.screen-rect.file-drag-over {
+  border-color: #60a5fa;
+  background: rgba(37, 99, 235, 0.24);
+  box-shadow:
+    inset 0 0 0 1px rgba(96, 165, 250, 0.42),
+    0 20px 36px rgba(0, 0, 0, 0.34);
+}
+
+.screen-rect.file-transfer-pending {
+  border-color: #2dd4bf;
+  background: rgba(15, 118, 110, 0.26);
+}
+
 .screen-status {
   position: absolute;
   top: 8px;
@@ -1180,89 +1168,6 @@
   color: #a1a1aa;
   font-size: 13px;
   overflow-wrap: anywhere;
-}
-
-.file-transfer-card {
-  display: grid;
-  gap: 12px;
-}
-
-.file-transfer-card .card-title-row {
-  align-items: start;
-}
-
-.file-transfer-card .muted-copy {
-  margin-top: 6px;
-}
-
-.file-drop-grid {
-  display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-  gap: 10px;
-}
-
-.file-drop-zone {
-  min-height: 82px;
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  padding: 12px;
-  border: 1px dashed rgba(113, 113, 122, 0.95);
-  border-radius: 8px;
-  background: #242429;
-  transition:
-    border-color 140ms ease,
-    background 140ms ease,
-    box-shadow 140ms ease;
-}
-
-.file-drop-zone.drag-over {
-  border-color: #60a5fa;
-  background: #202a36;
-  box-shadow: inset 0 0 0 1px rgba(96, 165, 250, 0.24);
-}
-
-.file-drop-zone.disabled {
-  opacity: 0.62;
-}
-
-.file-drop-zone div {
-  min-width: 0;
-  display: grid;
-  gap: 5px;
-}
-
-.file-drop-zone strong,
-.file-drop-zone span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.file-drop-zone strong {
-  color: #f4f4f5;
-  font-size: 14px;
-}
-
-.file-drop-zone span,
-.file-transfer-empty,
-.file-transfer-message {
-  color: #a1a1aa;
-  font-size: 13px;
-}
-
-.file-drop-zone small {
-  justify-self: end;
-  color: #60a5fa;
-  font-size: 12px;
-  font-weight: 800;
-  white-space: nowrap;
-}
-
-.file-transfer-empty,
-.file-transfer-message {
-  margin: 0;
 }
 
 .tag-pill {
@@ -1969,6 +1874,18 @@
   border-radius: 10px;
   background: rgba(127, 29, 29, 0.28);
   color: #fecaca;
+}
+
+.info-banner {
+  margin: 0;
+  padding: 10px 12px;
+  border: 1px solid rgba(45, 212, 191, 0.28);
+  border-radius: 10px;
+  background: rgba(15, 118, 110, 0.22);
+  color: #ccfbf1;
+  font-size: 13px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
 }
 
 .error-banner-message {

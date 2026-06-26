@@ -69,6 +69,7 @@ export interface LayoutState {
   pairSecret: string
   pairedControllers: PairedController[]
   clipboardSync: boolean
+  fileTransferEnabled: boolean
   language: AppLanguage
   themeMode: ThemeMode
   performanceMonitor: boolean

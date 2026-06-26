@@ -22,6 +22,7 @@ export const defaultLayout: LayoutState = {
   pairSecret: 'browser-secret',
   pairedControllers: [],
   clipboardSync: false,
+  fileTransferEnabled: true,
   language: 'cn',
   themeMode: 'system',
   performanceMonitor: false,

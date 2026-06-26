@@ -4112,6 +4112,7 @@ mod tests {
             pair_secret: "secret-test".into(),
             paired_controllers: Vec::new(),
             clipboard_sync: false,
+            file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,

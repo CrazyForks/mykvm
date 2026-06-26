@@ -170,6 +170,8 @@ struct LayoutState {
     paired_controllers: Vec<PairedController>,
     #[serde(default = "default_clipboard_sync")]
     clipboard_sync: bool,
+    #[serde(default = "default_file_transfer_enabled")]
+    file_transfer_enabled: bool,
     #[serde(default = "default_language")]
     language: String,
     #[serde(default = "default_theme_mode")]
@@ -1653,6 +1655,9 @@ fn send_files_to_device(
 
     state.start_discovery()?;
     let layout = state.layout_snapshot();
+    if !layout.file_transfer_enabled {
+        return Err("文件传输未开启。".into());
+    }
     let mut local_peer = local_peer_from_layout(&layout);
     let quic_transport = state
         .quic_transport_handle()
@@ -3325,6 +3330,7 @@ fn detect_local_layout(app: &AppHandle) -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        file_transfer_enabled: default_file_transfer_enabled(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -3365,6 +3371,7 @@ fn detect_fallback_layout() -> LayoutState {
         pair_secret: default_pair_secret(),
         paired_controllers: Vec::new(),
         clipboard_sync: default_clipboard_sync(),
+        file_transfer_enabled: default_file_transfer_enabled(),
         language: default_language(),
         theme_mode: default_theme_mode(),
         performance_monitor: default_performance_monitor(),
@@ -3475,6 +3482,7 @@ fn normalize_saved_layout(saved_layout: LayoutState, detected_layout: LayoutStat
         pair_secret: normalize_pair_secret(&saved_layout.pair_secret),
         paired_controllers: normalize_paired_controllers(saved_layout.paired_controllers),
         clipboard_sync: saved_layout.clipboard_sync,
+        file_transfer_enabled: saved_layout.file_transfer_enabled,
         language: normalize_language(&saved_layout.language),
         theme_mode: normalize_theme_mode(&saved_layout.theme_mode),
         performance_monitor: saved_layout.performance_monitor,
@@ -3628,6 +3636,10 @@ fn default_pair_secret() -> String {
 
 fn default_clipboard_sync() -> bool {
     false
+}
+
+fn default_file_transfer_enabled() -> bool {
+    true
 }
 
 fn default_language() -> String {
@@ -4592,6 +4604,9 @@ fn handle_file_transfer_packet_with_root(
     };
 
     if packet.protocol != FILE_TRANSFER_PROTOCOL {
+        return false;
+    }
+    if !layout.file_transfer_enabled {
         return false;
     }
     if !file_transfer_packet_authorized(layout, &packet) {
@@ -6238,6 +6253,7 @@ mod tests {
             pair_secret: "secret-test".into(),
             paired_controllers: Vec::new(),
             clipboard_sync: false,
+            file_transfer_enabled: true,
             language: "cn".into(),
             theme_mode: "system".into(),
             performance_monitor: false,
