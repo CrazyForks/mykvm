@@ -208,6 +208,7 @@ function App() {
   );
   const boardRef = useRef<HTMLDivElement | null>(null);
   const fileDragTargetIdRef = useRef<string | null>(null);
+  const fileTransferFallbackTargetIdRef = useRef<string | null>(null);
   const startupUpdateCheckStarted = useRef(false);
   const snapshotRef = useRef<AppStateSnapshot | null>(null);
 
@@ -230,10 +231,13 @@ function App() {
         const targetDeviceId =
           snapshotRef.current?.layout.fileTransferEnabled === false
             ? null
-            : fileTransferTargetIdAtPosition({
-                x: event.clientX,
-                y: event.clientY,
-              });
+            : fileTransferTargetIdAtPosition(
+                {
+                  x: event.clientX,
+                  y: event.clientY,
+                },
+                fileTransferFallbackTargetIdRef.current,
+              );
         event.dataTransfer.dropEffect =
           targetDeviceId === null ? "none" : "copy";
       }
@@ -849,13 +853,21 @@ function App() {
         }
 
         if (payload.type === "over") {
-          setFileDragTargetId(fileTransferTargetIdAtPosition(payload.position));
+          setFileDragTargetId(
+            fileTransferTargetIdAtPosition(
+              payload.position,
+              fileTransferFallbackTargetIdRef.current,
+            ),
+          );
           return;
         }
 
         if (payload.type === "drop") {
           const targetDeviceId =
-            fileTransferTargetIdAtPosition(payload.position) ??
+            fileTransferTargetIdAtPosition(
+              payload.position,
+              fileTransferFallbackTargetIdRef.current,
+            ) ??
             fileDragTargetIdRef.current;
           setFileDragTargetId(null);
           if (targetDeviceId && payload.paths?.length) {
@@ -1628,6 +1640,11 @@ function App() {
   const serverFileTransferTargetIds = new Set(
     serverFileTransferTargets.map((device) => device.id),
   );
+  const clientFileTransferTargetId =
+    fileTransferEnabled && machineRole === "client"
+      ? (preferredPairedControllerId(layout, lanPeers) ?? null)
+      : null;
+  fileTransferFallbackTargetIdRef.current = clientFileTransferTargetId;
 
   function screenFileTransferTargetId(screen: FlattenedScreen) {
     if (
@@ -3061,14 +3078,37 @@ function formatScreenCount(count: number, language: AppLanguage) {
     : `${count} 屏`;
 }
 
-function fileTransferTargetIdAtPosition(position?: FileDropPosition | null) {
+function fileTransferTargetIdAtPosition(
+  position?: FileDropPosition | null,
+  fallbackTargetId?: string | null,
+) {
   if (!position) {
-    return null;
+    return fallbackTargetId ?? null;
   }
 
   const element = document.elementFromPoint(position.x, position.y);
   const target = element?.closest<HTMLElement>("[data-file-transfer-target]");
-  return target?.dataset.fileTransferTarget ?? null;
+  return target?.dataset.fileTransferTarget ?? fallbackTargetId ?? null;
+}
+
+function preferredPairedControllerId(
+  layout: LayoutState,
+  peers: LanPeer[],
+): string | null {
+  if (layout.pairedControllers.length === 0) {
+    return null;
+  }
+
+  return (
+    layout.pairedControllers.find((controller) =>
+      peers.some(
+        (peer) =>
+          peer.id === controller.id ||
+          (controller.transportPublicKey.trim().length > 0 &&
+            peer.transportPublicKey === controller.transportPublicKey),
+      ),
+    )?.id ?? layout.pairedControllers[0].id
+  );
 }
 
 function formatFileTransferSummary(
