@@ -975,6 +975,7 @@ impl AppRuntime {
                             if peer_visible_to_layout(&current_layout, &incoming.peer) {
                                 merge_peer(&peers, incoming.peer.clone());
                                 sync_layout_peer_presence(&layout_state, &peers);
+                                warm_quic_peer(&quic_transport, &incoming.peer);
                             }
 
                             if matches!(incoming.kind.as_str(), "announce" | "probe") {
@@ -2560,7 +2561,13 @@ fn request_lan_pairing(
     if let Some(transport) = state.quic_transport_handle() {
         apply_transport_to_peer(&mut local_peer, &transport);
     }
-    let peer = request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout))?;
+    let peer = match request_pairing_for_peer(&local_peer, &host, discovery_base_port(&layout)) {
+        Ok(peer) => peer,
+        Err(error) => {
+            log::warn!("LAN pairing request failed host={host}: {error}");
+            return Err(error);
+        }
+    };
     merge_peer(&state.peers, peer.clone());
     Ok(peer)
 }
@@ -2586,14 +2593,20 @@ fn confirm_lan_pairing(
         .quic_transport_handle()
         .ok_or_else(|| "QUIC 传输未启动，无法安全确认配对。".to_string())?;
     apply_transport_to_peer(&mut local_peer, &transport);
-    let peer = confirm_pairing_for_peer(
+    let peer = match confirm_pairing_for_peer(
         &local_peer,
         &transport,
         &layout.pair_secret,
         &host,
         &code,
         discovery_base_port(&layout),
-    )?;
+    ) {
+        Ok(peer) => peer,
+        Err(error) => {
+            log::warn!("LAN pairing confirm failed host={host}: {error}");
+            return Err(error);
+        }
+    };
     merge_peer(&state.peers, peer.clone());
     sync_layout_peer_presence(&state.layout, &state.peers);
     Ok(peer)
@@ -2919,9 +2932,6 @@ where
 }
 
 #[cfg(target_os = "macos")]
-static MACOS_APPKIT_CURSOR_HIDE_COUNT: AtomicU64 = AtomicU64::new(0);
-
-#[cfg(target_os = "macos")]
 fn macos_miniaturize_window(window: &tauri::WebviewWindow) -> Result<(), String> {
     use std::ffi::c_void;
     use std::os::raw::c_char;
@@ -2997,49 +3007,6 @@ fn macos_order_front_window(window: &tauri::WebviewWindow) -> Result<(), String>
     Ok(())
 }
 
-/// Hide/unhide through AppKit without activating MyKVM. CoreGraphics cursor
-/// hide/decouple APIs are foreground-sensitive; AppKit's cursor hide stack lets
-/// us make the cursor invisible while the HID tap forwards movement to the
-/// remote client, without raising the visible MyKVM window.
-#[cfg(target_os = "macos")]
-fn macos_set_cursor_hidden_with_appkit(hidden: bool) {
-    use std::ffi::c_void;
-    use std::os::raw::c_char;
-
-    #[link(name = "objc")]
-    extern "C" {
-        fn objc_getClass(name: *const c_char) -> *mut c_void;
-        fn sel_registerName(name: *const c_char) -> *mut c_void;
-        fn objc_msgSend();
-    }
-
-    unsafe {
-        let class = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
-        if class.is_null() {
-            return;
-        }
-        let selector = if hidden {
-            if MACOS_APPKIT_CURSOR_HIDE_COUNT.load(Ordering::Relaxed) >= 128 {
-                return;
-            }
-            MACOS_APPKIT_CURSOR_HIDE_COUNT.fetch_add(1, Ordering::Relaxed);
-            sel_registerName(b"hide\0".as_ptr() as *const c_char)
-        } else {
-            let count = MACOS_APPKIT_CURSOR_HIDE_COUNT.swap(0, Ordering::Relaxed);
-            let unhide_sel = sel_registerName(b"unhide\0".as_ptr() as *const c_char);
-            let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
-                std::mem::transmute(objc_msgSend as *const ());
-            for _ in 0..count {
-                msg_void(class, unhide_sel);
-            }
-            return;
-        };
-        let msg_void: extern "C" fn(*mut c_void, *mut c_void) =
-            std::mem::transmute(objc_msgSend as *const ());
-        msg_void(class, selector);
-    }
-}
-
 #[cfg(target_os = "macos")]
 fn macos_set_main_webview_cursor_hidden(app: &AppHandle, hidden: bool) {
     let Some(window) = app.get_webview_window("main") else {
@@ -3055,6 +3022,15 @@ fn macos_set_main_webview_cursor_hidden(app: &AppHandle, hidden: bool) {
 
 #[cfg(target_os = "macos")]
 fn setup_macos_cursor_hider(app: &tauri::App) {
+    // Only mirror remote-input state onto the webview DOM (a CSS `cursor:none`
+    // toggle that matters only while the window is visible). The actual pointer
+    // hide/show is driven synchronously from the input-capture thread in
+    // input.rs (CGDisplayHideCursor + NSCursor hide), so do NOT also call
+    // NSCursor here: `run_on_main_thread` lands on the main run loop, which
+    // macOS de-prioritizes once the window is hidden/minimized, so a hide/unhide
+    // posted here can sit in the queue for ~1s and then race the capture thread's
+    // synchronous calls — the "cursor hides a second late, sometimes instantly"
+    // stutter. Leaving only the DOM mirror keeps that path free of cursor work.
     let remote_active = app.state::<AppRuntime>().remote_input_active.clone();
     let app_handle = app.handle().clone();
     thread::spawn(move || {
@@ -3068,7 +3044,6 @@ fn setup_macos_cursor_hider(app: &tauri::App) {
             was_active = active;
             let handle = app_handle.clone();
             let _ = app_handle.run_on_main_thread(move || {
-                macos_set_cursor_hidden_with_appkit(active);
                 macos_set_main_webview_cursor_hidden(&handle, active);
             });
         }
@@ -3132,7 +3107,7 @@ pub fn run() {
                 }
                 if let WindowEvent::CloseRequested { api, .. } = event {
                     api.prevent_close();
-                    let _ = destroy_main_window_handle(window.app_handle());
+                    let _ = hide_main_window_handle(window.app_handle());
                 }
             }
         })
@@ -3221,7 +3196,7 @@ pub fn run() {
             apply_custom_chrome(app.handle())?;
             setup_single_instance_events(app.handle().clone());
             if silent_launch {
-                destroy_main_window_handle(app.handle())?;
+                hide_main_window_handle(app.handle())?;
             } else {
                 show_main_window_handle(app.handle())?;
             }
@@ -3371,9 +3346,30 @@ fn show_main_window_handle(app: &AppHandle) -> Result<(), String> {
 }
 
 fn hide_main_window_handle(app: &AppHandle) -> Result<(), String> {
-    destroy_main_window_handle(app)
+    #[cfg(target_os = "macos")]
+    {
+        let Some(window) = app.get_webview_window("main") else {
+            set_main_window_visible(app, false);
+            set_main_window_focused(app, false);
+            return Ok(());
+        };
+        let result = window
+            .hide()
+            .map_err(|error| format!("failed to hide main window: {error}"));
+        if result.is_ok() {
+            set_main_window_visible(app, false);
+            set_main_window_focused(app, false);
+        }
+        result
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        destroy_main_window_handle(app)
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn destroy_main_window_handle(app: &AppHandle) -> Result<(), String> {
     let Some(window) = app.get_webview_window("main") else {
         set_main_window_visible(app, false);
@@ -6362,6 +6358,18 @@ fn apply_transport_to_peer(peer: &mut LanPeer, transport: &quic_transport::Trans
     peer.quic_port = transport.port();
     peer.transport_public_key = transport.public_key().to_string();
     peer.protocol_version = quic_transport::PROTOCOL_VERSION;
+}
+
+fn warm_quic_peer(transport: &quic_transport::TransportHandle, peer: &LanPeer) {
+    if !peer.input_ready || peer.transport_public_key.trim().is_empty() || peer.quic_port == 0 {
+        return;
+    }
+    let endpoint = transport.peer(
+        format!("{}:{}", peer.ip, peer.quic_port),
+        peer.transport_public_key.clone(),
+        peer.protocol_version,
+    );
+    let _ = transport.send_datagram(endpoint, Vec::new());
 }
 
 fn pairing_required(layout: &LayoutState) -> bool {

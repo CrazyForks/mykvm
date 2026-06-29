@@ -22,14 +22,26 @@ use crate::{
 const INPUT_PROTOCOL: &str = "mykvm.input.v1";
 const INPUT_CONTROL_PROTOCOL: &str = "mykvm.input-control.v1";
 const EDGE_TOLERANCE: i32 = 80;
-const CROSSING_MARGIN: f64 = 4.0;
+// The cursor must reach the very edge pixel before a crossing is considered.
+// macOS clamps the pointer to the screen, so the furthest it can sit is
+// width-1 (the last pixel); x >= right-1 means "pushed flush against the edge",
+// matching how a real extended display only hands off once the cursor is on the
+// boundary. CGEvent deltas are raw HID movement, so a positive dx with the
+// pointer already pinned at the edge still reads as the user pushing outward —
+// that push is what triggers the handoff.
+const CROSSING_MARGIN: f64 = 1.0;
 const MIN_CROSSING_DELTA: f64 = 1.0;
 const CROSSING_AXIS_DOMINANCE: f64 = 0.5;
 const CROSSING_ACTIVATION_BAND: f64 = EDGE_TOLERANCE as f64 * 2.0;
-// On return to the local machine, drop the cursor this many pixels inside the
-// entry edge instead of flush against it. Clears CROSSING_MARGIN so a fast
-// return flick can't immediately bounce back across into the remote.
-const RETURN_EDGE_INSET: f64 = 12.0;
+// On return to the local machine, land the cursor flush against the entry edge
+// (0px inset) for a seamless extended-display feel, mirroring how the cursor
+// would sit at the edge of a real second monitor. Re-bounce after a fast
+// back-flick is prevented by a time-based return cooldown (last_return), not by
+// inset distance, so the cursor can sit exactly on the edge.
+const RETURN_EDGE_INSET: f64 = 0.0;
+// After returning to local, refuse to cross back into the remote for this long.
+// Lets a fast back-flick settle at the edge without bouncing into the remote.
+const RETURN_COOLDOWN_MS: u64 = 150;
 const MOUSE_MOVE_SEND_INTERVAL_MS: u64 = 8;
 const DRAG_MOVE_SEND_INTERVAL_MS: u64 = 8;
 #[cfg(target_os = "windows")]
@@ -329,7 +341,7 @@ fn start_platform_capture(
     quic_transport: quic_transport::TransportHandle,
     stop: Arc<AtomicBool>,
     remote_active: Arc<AtomicBool>,
-    main_window_visible: Arc<AtomicBool>,
+    _main_window_visible: Arc<AtomicBool>,
     _main_window_focused: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
@@ -352,13 +364,13 @@ fn start_platform_capture(
             native_layout,
             active: Mutex::new(None),
             remote_active,
-            main_window_visible,
             clipboard_target,
             input_events,
             anchor: Mutex::new(None),
             cursor_hidden: Mutex::new(false),
             last_mouse_move_sent: Mutex::new(None),
             last_cursor_repin: Mutex::new(None),
+            last_return: Mutex::new(None),
             remote_button_mask: AtomicU64::new(0),
             pressed_modifiers: Mutex::new(Vec::new()),
             pressed_keys: Mutex::new(Vec::new()),
@@ -434,12 +446,18 @@ fn start_platform_capture(
             // while" failure. Re-arm it as soon as we notice.
             if context.tap_disabled.swap(false, Ordering::Relaxed) {
                 tap.enable();
+                log::info!("[diag] event tap re-enabled after being disabled");
             }
+            // No cursor-hide reassert needed here: the transparent cursor pushed
+            // on entry stays active for the whole remote session with no
+            // hide/show state for WindowServer to drop. See
+            // set_macos_cursor_transparent.
         }
 
         // Critical safety: never leave the cursor decoupled after capture stops,
         // otherwise the user's mouse stays frozen until the app restarts.
         set_macos_cursor_decoupled(false);
+        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
         show_macos_cursor_if_needed(&context);
         set_macos_app_nap_suppressed(false);
         context.remote_active.store(false, Ordering::Relaxed);
@@ -1697,13 +1715,18 @@ struct MacCaptureContext {
     native_layout: LayoutState,
     active: Mutex<Option<ActiveTarget>>,
     remote_active: Arc<AtomicBool>,
-    main_window_visible: Arc<AtomicBool>,
     clipboard_target: Arc<Mutex<Option<ClipboardTarget>>>,
     input_events: Arc<AtomicU64>,
     anchor: Mutex<Option<(f64, f64)>>,
     cursor_hidden: Mutex<bool>,
     last_mouse_move_sent: Mutex<Option<Instant>>,
     last_cursor_repin: Mutex<Option<Instant>>,
+    // Instant we last returned control to the local machine. We now land the
+    // cursor flush against the edge (RETURN_EDGE_INSET=0) for a seamless
+    // extended-display feel, so without a cooldown a fast back-flick would
+    // immediately re-satisfy the crossing test and bounce to the remote. During
+    // the cooldown window we refuse to cross, letting the user's slide settle.
+    last_return: Mutex<Option<Instant>>,
     remote_button_mask: AtomicU64,
     pressed_modifiers: Mutex<Vec<u16>>,
     // Regular (non-modifier) keys we have forwarded as held, so they can be
@@ -2626,6 +2649,10 @@ fn handle_macos_event(
         // Flag for the run-loop thread to re-enable; the cursor and remote state
         // are reset there too so we don't get stuck mid-control.
         context.tap_disabled.store(true, Ordering::Relaxed);
+        log::info!(
+            "[diag] event tap disabled by {:?} — mouse/key events are now DROPPED until re-enabled",
+            event_type
+        );
         return CallbackResult::Keep;
     }
 
@@ -2763,6 +2790,12 @@ fn handle_macos_mouse_move(
                 *active = None;
                 context.remote_active.store(false, Ordering::Relaxed);
                 context.just_crossed.store(false, Ordering::Relaxed);
+                // Record the return instant so the crossing test can enforce a
+                // short cooldown — without it, landing flush on the edge (inset
+                // 0) would let a fast back-flick immediately re-cross.
+                if let Ok(mut last_return) = context.last_return.lock() {
+                    *last_return = Some(Instant::now());
+                }
                 // Keep the clipboard peer so copies still sync after returning.
                 release_held_remote_inputs_macos(context, &target);
                 reset_mouse_move_timer(&context.last_mouse_move_sent);
@@ -2782,6 +2815,7 @@ fn handle_macos_mouse_move(
                 move_macos_cursor_without_event(context, CGPoint::new(point.0, point.1));
                 set_macos_cursor_decoupled(false);
                 set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+                log::info!("[diag] cross BACK to local — showing cursor now");
                 show_macos_cursor_if_needed(context);
                 return CallbackResult::Drop;
             }
@@ -2813,17 +2847,34 @@ fn handle_macos_mouse_move(
                     if let Ok(mut anchor) = context.anchor.lock() {
                         *anchor = None;
                     }
+                    set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
                     set_macos_cursor_decoupled(false);
                     show_macos_cursor_if_needed(context);
                     return CallbackResult::Keep;
                 }
             }
             repin_macos_cursor_if_drifted(context, location);
+            // Cursor hide re-assertion runs from the capture run loop (see
+            // start_platform_capture), NOT from this mouse-move callback: once the
+            // pointer is over the client the server stops getting mouse-move
+            // events, so a reassert hooked here would silently stop and leave the
+            // pointer visible when WindowServer drops our background hide.
             return CallbackResult::Drop;
         }
     }
 
     let targets = current_input_targets(&context.layout_state, &context.native_layout);
+    // Return cooldown: the cursor now lands flush on the edge (inset 0) on
+    // return, so without this gate a fast back-flick immediately re-satisfies
+    // the crossing test and bounces into the remote. Ignore crossings for a
+    // short window after returning so the user's slide settles locally.
+    if let Ok(last_return) = context.last_return.lock() {
+        if let Some(when) = *last_return {
+            if when.elapsed() < Duration::from_millis(RETURN_COOLDOWN_MS) {
+                return CallbackResult::Keep;
+            }
+        }
+    }
     if let Some(active_target) =
         mac_crossing_target(context, &targets, location.x, location.y, dx, dy)
     {
@@ -2834,9 +2885,17 @@ fn handle_macos_mouse_move(
         );
         set_macos_cursor_decoupled(true);
         set_macos_warp_suppression_interval(0.0);
-        move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
-        set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
+        // Hide BEFORE the anchor warp: when MyKVM is hidden/minimized it runs as a
+        // background process, and the WindowServer services a background process's
+        // cursor-warp and cursor-hide calls lazily. If we warp first the user sees
+        // the pointer flick to the screen edge and linger there until the delayed
+        // hide lands — the "cursor sticks at the edge, hides late" stutter, whose
+        // visible offset scales with flick speed. Hiding first means the pointer
+        // vanishes where it is, then jumps to the anchor invisibly, so no edge
+        // stick is ever visible regardless of scheduling latency.
+        log::info!("[diag] cross INTO remote — hiding+decoupling now");
         hide_macos_cursor_if_needed(context);
+        move_macos_cursor_without_event(context, CGPoint::new(anchor.0, anchor.1));
         if !send_remote_mouse_move(
             &context.quic_transport,
             &active_target,
@@ -2846,6 +2905,7 @@ fn handle_macos_mouse_move(
             reset_mouse_move_timer(&context.last_mouse_move_sent);
             reset_remote_button_mask(&context.remote_button_mask);
             reset_cursor_repin_timer(context);
+            set_macos_warp_suppression_interval(MACOS_DEFAULT_WARP_SUPPRESSION_SECS);
             set_macos_cursor_decoupled(false);
             show_macos_cursor_if_needed(context);
             context.just_crossed.store(false, Ordering::Relaxed);
@@ -2904,18 +2964,24 @@ fn crossing_target_with_transform(
             crossing_layout_point(target, x, y, dx, dy).map(|point| (target, point))
         })
         .map(|(target, (mapped_x, mapped_y))| {
+            let entry_dx = dx * target.layout_local_screen.width.max(1) as f64
+                / target.local_screen.width.max(1) as f64;
+            let entry_dy = dy * target.layout_local_screen.height.max(1) as f64
+                / target.local_screen.height.max(1) as f64;
             let remote_x = match target.edge {
-                Edge::Right => 1.0,
-                Edge::Left => (target.remote_screen.width - 2) as f64,
+                Edge::Right => 1.0 + entry_dx.max(0.0),
+                Edge::Left => (target.remote_screen.width - 2) as f64 + entry_dx.min(0.0),
                 _ => (mapped_x - target.remote_screen.x as f64)
                     .clamp(0.0, (target.remote_screen.width - 1) as f64),
-            };
+            }
+            .clamp(0.0, (target.remote_screen.width - 1) as f64);
             let remote_y = match target.edge {
-                Edge::Bottom => 1.0,
-                Edge::Top => (target.remote_screen.height - 2) as f64,
+                Edge::Bottom => 1.0 + entry_dy.max(0.0),
+                Edge::Top => (target.remote_screen.height - 2) as f64 + entry_dy.min(0.0),
                 _ => (mapped_y - target.remote_screen.y as f64)
                     .clamp(0.0, (target.remote_screen.height - 1) as f64),
-            };
+            }
+            .clamp(0.0, (target.remote_screen.height - 1) as f64);
 
             // The screen we cross into is the entry screen; carry it (with its
             // wire id) as the initial "current" screen so the cursor can later
@@ -3218,10 +3284,10 @@ fn local_return_point(active: &ActiveTarget) -> (f64, f64) {
     let native_x = local.x as f64 + ratio_x * local.width.max(1) as f64;
     let native_y = local.y as f64 + ratio_y * local.height.max(1) as f64;
 
-    // Land the cursor RETURN_EDGE_INSET pixels inside the entry edge (not flush
-    // against it). Sitting 1-2px from the edge used to fall inside CROSSING_MARGIN,
-    // so a quick return flick re-satisfied the crossing test and bounced straight
-    // back to the remote. Insetting clears that margin.
+    // Land the cursor flush on the entry edge (RETURN_EDGE_INSET=0) for a
+    // seamless extended-display feel. A fast back-flick can no longer bounce
+    // straight back into the remote because the crossing test is gated by a
+    // time-based cooldown (RETURN_COOLDOWN_MS), not by inset distance.
     let inset = RETURN_EDGE_INSET.min((local.width.max(1) - 1) as f64 / 2.0);
     let inset_v = RETURN_EDGE_INSET.min((local.height.max(1) - 1) as f64 / 2.0);
     match active.target.edge {
@@ -3320,13 +3386,9 @@ const MACOS_DEFAULT_WARP_SUPPRESSION_SECS: f64 = 0.25;
 /// Set how long macOS suppresses local hardware mouse events after a cursor
 /// warp (`CGWarpMouseCursorPosition` / `CGDisplayMoveCursorToPoint`).
 ///
-/// This is a process-wide setting, so it must NOT be left at `0`: while not
-/// frontmost the OS re-associates the cursor and the capture loop re-pins it
-/// with warps, and the suppression window is what *parks* the warped cursor at
-/// the anchor between re-pins. With it at `0` the server cursor visibly follows
-/// the mouse and edge crossing gets confused. Instead, drop it to `0` only for
-/// the single slide-back warp (so the local pointer tracks immediately instead
-/// of freezing ~0.25s) and restore the default right after.
+/// This is process-wide. Keep it at `0` only while remote control is active so
+/// macOS does not swallow hardware deltas after our anchor/re-pin warps, then
+/// restore the default on every exit path.
 #[cfg(target_os = "macos")]
 fn set_macos_warp_suppression_interval(seconds: f64) {
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -3463,15 +3525,108 @@ fn set_macos_cursor_hidden_with_appkit(hidden: bool) {
     }
 }
 
+/// Push a fully-transparent cursor onto the AppKit cursor stack while a remote
+/// session is active, then pop it on return.
+///
+/// `CGDisplayHideCursor` / `NSCursor hide` proved unreliable for a background
+/// app: WindowServer services them lazily, so the pointer visibly lingers at the
+/// shared edge for a fraction of a second on every crossing — even when we
+/// re-issue hide every 50ms. A transparent cursor has no hidden/visible state
+/// to flip: it just paints nothing, so there is nothing for WindowServer to
+/// "un-hide". `push`/`pop` modify this app's active cursor image, which is far
+/// more robust than the global hide counter when MyKVM is not frontmost.
+#[cfg(target_os = "macos")]
+fn set_macos_cursor_transparent(transparent: bool) {
+    use std::ffi::c_void;
+    use std::os::raw::{c_char, c_double};
+
+    #[link(name = "objc")]
+    extern "C" {
+        fn objc_getClass(name: *const c_char) -> *mut c_void;
+        fn sel_registerName(name: *const c_char) -> *mut c_void;
+        fn objc_msgSend();
+    }
+
+    // A 16x16 fully-transparent RGBA bitmap. NSImage created from this paints
+    // nothing, so the cursor is visually absent without a hide/show call.
+    const SIZE: usize = 16;
+    static TRANSPARENT_BYTES: [u8; SIZE * SIZE * 4] = [0; SIZE * SIZE * 4];
+
+    unsafe {
+        let nscursor = objc_getClass(b"NSCursor\0".as_ptr() as *const c_char);
+        let nsimage = objc_getClass(b"NSImage\0".as_ptr() as *const c_char);
+        let nsdata = objc_getClass(b"NSData\0".as_ptr() as *const c_char);
+        let nssize = objc_getClass(b"NSSize\0".as_ptr() as *const c_char);
+        if nscursor.is_null() || nsimage.is_null() || nsdata.is_null() || nssize.is_null() {
+            return;
+        }
+
+        if !transparent {
+            // Pop our transparent cursor to restore the previous cursor image.
+            let pop_sel = sel_registerName(b"pop\0".as_ptr() as *const c_char);
+            let pop: extern "C" fn(*mut c_void, *mut c_void) =
+                std::mem::transmute(objc_msgSend as *const ());
+            pop(nscursor, pop_sel);
+            return;
+        }
+
+        // NSData dataWithBytes:length:
+        let data_sel = sel_registerName(b"dataWithBytes:length:\0".as_ptr() as *const c_char);
+        let data_with: extern "C" fn(*mut c_void, *mut c_void, *const u8, usize) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let data = data_with(nsdata, data_sel, TRANSPARENT_BYTES.as_ptr(), TRANSPARENT_BYTES.len());
+        if data.is_null() {
+            return;
+        }
+
+        // NSImage initWithData:
+        let alloc_sel = sel_registerName(b"alloc\0".as_ptr() as *const c_char);
+        let init_sel = sel_registerName(b"initWithData:\0".as_ptr() as *const c_char);
+        let alloc: extern "C" fn(*mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let image_obj = alloc(nsimage, alloc_sel);
+        let image = init(image_obj, init_sel, data);
+        if image.is_null() {
+            return;
+        }
+
+        // NSSize { width, height } value type, laid out as two doubles.
+        let size_sel = sel_registerName(b"setSize:\0".as_ptr() as *const c_char);
+        let set_size: extern "C" fn(*mut c_void, *mut c_void, c_double, c_double) =
+            std::mem::transmute(objc_msgSend as *const ());
+        set_size(image, size_sel, SIZE as c_double, SIZE as c_double);
+
+        // NSCursor initWithImage:hotSpot: — hot spot at (0,0), anywhere is fine
+        // since the cursor is invisible. hotSpot is an NSPoint (two CGFloats),
+        // passed by value; on arm64 that lands in the float argument registers as
+        // two doubles after the object-pointer argument.
+        let cursor_init_sel =
+            sel_registerName(b"initWithImage:hotSpot:\0".as_ptr() as *const c_char);
+        let cursor_init: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, c_double, c_double) -> *mut c_void =
+            std::mem::transmute(objc_msgSend as *const ());
+        let cursor_obj = alloc(nscursor, alloc_sel);
+        let cursor = cursor_init(cursor_obj, cursor_init_sel, image, 0.0, 0.0);
+        if cursor.is_null() {
+            return;
+        }
+
+        // [NSCursor push] — make it the active cursor.
+        let push_sel = sel_registerName(b"push\0".as_ptr() as *const c_char);
+        let push: extern "C" fn(*mut c_void, *mut c_void) =
+            std::mem::transmute(objc_msgSend as *const ());
+        push(cursor, push_sel);
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn repin_macos_cursor_if_drifted(
     context: &MacCaptureContext,
     location: core_graphics::geometry::CGPoint,
 ) {
-    const VISIBLE_DRIFT_THRESHOLD_PX: f64 = 1.5;
-    const HIDDEN_DRIFT_THRESHOLD_PX: f64 = 48.0;
-    const VISIBLE_REPIN_INTERVAL_MS: u64 = 8;
-    const HIDDEN_REPIN_INTERVAL_MS: u64 = 50;
+    const DRIFT_THRESHOLD_PX: f64 = 1.5;
+    const REPIN_INTERVAL_MS: u64 = 8;
 
     let Ok(anchor) = context.anchor.lock() else {
         return;
@@ -3481,31 +3636,19 @@ fn repin_macos_cursor_if_drifted(
     };
     drop(anchor);
 
-    let window_visible = context.main_window_visible.load(Ordering::Relaxed);
-    let drift_threshold = if window_visible {
-        VISIBLE_DRIFT_THRESHOLD_PX
-    } else {
-        HIDDEN_DRIFT_THRESHOLD_PX
-    };
     let dx = location.x - x;
     let dy = location.y - y;
-    if dx.abs() <= drift_threshold && dy.abs() <= drift_threshold {
+    if dx.abs() <= DRIFT_THRESHOLD_PX && dy.abs() <= DRIFT_THRESHOLD_PX {
         return;
     }
 
-    let repin_interval = Duration::from_millis(if window_visible {
-        VISIBLE_REPIN_INTERVAL_MS
-    } else {
-        HIDDEN_REPIN_INTERVAL_MS
-    });
-    if !macos_cursor_repin_due(context, repin_interval) {
+    if !macos_cursor_repin_due(context, Duration::from_millis(REPIN_INTERVAL_MS)) {
         return;
     }
 
     // When MyKVM is not frontmost, macOS can re-associate the cursor with the
     // physical mouse despite CGAssociateMouseAndMouseCursorPosition(false).
-    // Re-pin only after actual drift and at a capped rate. Hidden/minimized
-    // windows get a looser cap to avoid visible edge-switch stutter.
+    // Re-pin only after actual drift and at a capped rate.
     set_macos_cursor_decoupled(true);
     move_macos_cursor_without_event(context, core_graphics::geometry::CGPoint::new(x, y));
     hide_macos_cursor_if_needed(context);
@@ -3660,10 +3803,16 @@ fn hide_macos_cursor_if_needed(context: &MacCaptureContext) {
         return;
     }
 
-    // Arm background hiding before the first hide so the pointer disappears at
-    // the edge even when MyKVM is minimized / not frontmost.
+    // The PRIMARY mechanism is a transparent cursor (set_macos_cursor_transparent):
+    // CGDisplayHideCursor / NSCursor hide are unreliable for a background app
+    // (WindowServer services them lazily, pointer flickers at the edge). The
+    // transparent cursor paints nothing with no hide/show state to flip. We keep
+    // the hide calls as a secondary belt-and-suspenders, but they are no longer
+    // the thing we rely on.
     enable_macos_background_cursor_hide();
+    set_macos_cursor_transparent(true);
     set_macos_cursor_hidden_with_appkit(true);
+    log::info!("[diag] transparent cursor pushed + hide issued (cursor_hidden false->true)");
 
     if context.display_snapshots.is_empty() {
         let _ = core_graphics::display::CGDisplay::main().hide_cursor();
@@ -3684,6 +3833,10 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
         return;
     }
 
+    // Pop the transparent cursor first — this restores the real cursor image
+    // and is the reliable inverse of the hide. The CGDisplay/NSCursor show calls
+    // balance the secondary hide calls.
+    set_macos_cursor_transparent(false);
     if context.display_snapshots.is_empty() {
         let _ = core_graphics::display::CGDisplay::main().show_cursor();
     } else {
@@ -3693,6 +3846,9 @@ fn show_macos_cursor_if_needed(context: &MacCaptureContext) {
     }
     set_macos_cursor_hidden_with_appkit(false);
     *hidden = false;
+    log::info!(
+        "[diag] transparent cursor popped + show issued (cursor_hidden true->false)"
+    );
 }
 
 #[cfg(target_os = "macos")]
@@ -4505,7 +4661,10 @@ mod tests {
             y: 500.0,
             invert_y: false,
         };
-        let dx = -RETURN_EDGE_INSET;
+        // Simulate the small leftward delta the entry-anchor warp can inject.
+        // (Was -RETURN_EDGE_INSET; now that the inset is 0 for edge-flush returns,
+        // use a small fixed delta that still represents the warp's momentum.)
+        let dx = -8.0;
         let dy = 0.0;
 
         let mut unguarded = active.clone();
@@ -4854,11 +5013,26 @@ mod tests {
     fn crossing_accepts_native_screen_coordinates() {
         let target = target_for_coordinate_tests();
 
-        let mapped = crossing_layout_point(&target, 1918.0, 500.0, 5.0, 0.0)
+        // Native width 1920, so the cursor must reach the edge pixel x=1919
+        // (CROSSING_MARGIN=1) before a crossing is accepted.
+        let mapped = crossing_layout_point(&target, 1919.0, 500.0, 5.0, 0.0)
             .expect("native edge should cross");
 
         assert!(mapped.0 > -9404.0);
         assert!(mapped.0 <= -9400.0);
+    }
+
+    #[test]
+    fn fast_crossing_carries_entry_delta_into_remote() {
+        let target = target_for_coordinate_tests();
+        let layout_state = Arc::new(Mutex::new(layout_for_target_tests()));
+        let active = crossing_target(&[target], 1919.0, 500.0, 40.0, 0.0, &layout_state)
+            .expect("fast edge movement should cross");
+
+        assert!(
+            active.x > 1.0,
+            "dropping the crossing delta makes the cursor feel stuck at the edge"
+        );
     }
 
     #[test]
@@ -4895,7 +5069,9 @@ mod tests {
 
         assert!(crossing_layout_point(&target, 1918.0, 600.0, 5.0, 0.0).is_none());
 
-        let mapped = crossing_layout_point(&target, 3838.0, 1200.0, 5.0, 0.0)
+        // Native width 3840, so the edge pixel is x=3839; the cursor must reach
+        // it (CROSSING_MARGIN=1) before crossing.
+        let mapped = crossing_layout_point(&target, 3839.0, 1200.0, 5.0, 0.0)
             .expect("native edge should cross");
 
         assert!(mapped.0 > 1916.0);
