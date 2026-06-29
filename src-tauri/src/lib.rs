@@ -3,7 +3,7 @@ use std::{
     env, fs,
     hash::{Hash, Hasher},
     io::{Read, Write},
-    net::{SocketAddr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, UdpSocket},
     path::{Path, PathBuf},
     process::Command,
     sync::{
@@ -4442,6 +4442,53 @@ fn local_ip_address() -> Option<String> {
     Some(address.ip().to_string())
 }
 
+fn local_ipv4_addresses() -> Vec<Ipv4Addr> {
+    let mut addresses = Vec::new();
+
+    if let Ok(interfaces) = if_addrs::get_if_addrs() {
+        for interface in interfaces {
+            if interface.is_loopback() {
+                continue;
+            }
+
+            let if_addrs::IfAddr::V4(address) = interface.addr else {
+                continue;
+            };
+            if usable_discovery_ipv4(address.ip) {
+                addresses.push(address.ip);
+            }
+        }
+    }
+
+    if let Some(default_ip) = default_route_ipv4_address() {
+        if usable_discovery_ipv4(default_ip) {
+            addresses.insert(0, default_ip);
+        }
+    }
+
+    addresses.sort_by_key(|address| address.octets());
+    addresses.dedup();
+    addresses
+}
+
+fn default_route_ipv4_address() -> Option<Ipv4Addr> {
+    let socket = UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("8.8.8.8:80").ok()?;
+    let address = socket.local_addr().ok()?;
+    match address.ip() {
+        std::net::IpAddr::V4(ip) => Some(ip),
+        std::net::IpAddr::V6(_) => None,
+    }
+}
+
+fn usable_discovery_ipv4(address: Ipv4Addr) -> bool {
+    !address.is_loopback()
+        && !address.is_unspecified()
+        && !address.is_multicast()
+        && !address.is_broadcast()
+        && !address.is_link_local()
+}
+
 fn default_device_source() -> String {
     "manual".into()
 }
@@ -6541,7 +6588,7 @@ fn confirm_pairing_for_peer(
         challenge_peer.protocol_version,
     );
     quic_transport
-        .send_stream(endpoint, payload)
+        .send_stream_expect_ack(endpoint, payload)
         .map_err(|error| format!("failed to send encrypted pairing confirmation: {error}"))?;
 
     let paired_peer = probe_for_peer(local_peer, host, base_port)?;
@@ -6828,7 +6875,7 @@ fn handle_pairing_stream_packet(
     let Some(incoming) =
         peer_from_discovery_packet(packet, source.ip().to_string(), &local_peer_id)
     else {
-        return true;
+        return false;
     };
 
     match complete_pairing_from_confirm(
@@ -6843,13 +6890,13 @@ fn handle_pairing_stream_packet(
         Ok(()) => {
             merge_peer(peers, incoming.peer);
             sync_layout_peer_presence(layout_state, peers);
+            true
         }
         Err(error) => {
             log::warn!("pairing confirmation rejected: {error}");
+            false
         }
     }
-
-    true
 }
 
 fn begin_pairing_challenge(
@@ -7025,16 +7072,16 @@ fn discovery_detail(peer_count: usize, listening: bool, port: u16) -> String {
 /// whole span — rather than a single port — lets us reach peers that drifted
 /// onto a neighbouring port when their preferred port was momentarily taken.
 pub(crate) fn broadcast_addrs(base_port: u16) -> Vec<String> {
-    let subnet_prefix = local_ip_address().and_then(|ip| {
-        let parts = ip.split('.').collect::<Vec<_>>();
-        (parts.len() == 4).then(|| format!("{}.{}.{}", parts[0], parts[1], parts[2]))
-    });
+    broadcast_addrs_for_ips(base_port, &local_ipv4_addresses())
+}
 
+fn broadcast_addrs_for_ips(base_port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
     let mut addresses = Vec::new();
     for port in discovery_target_ports(base_port) {
         addresses.push(format!("255.255.255.255:{port}"));
-        if let Some(prefix) = &subnet_prefix {
-            addresses.push(format!("{prefix}.255:{port}"));
+        for ip in local_ips {
+            let [a, b, c, _] = ip.octets();
+            addresses.push(format!("{a}.{b}.{c}.255:{port}"));
         }
     }
 
@@ -7145,25 +7192,31 @@ fn discovery_base_port(layout: &LayoutState) -> u16 {
 /// drops broadcast traffic (common with Wi-Fi "AP/client isolation" and some
 /// managed switches) but still forwards unicast between clients.
 pub(crate) fn unicast_sweep_targets(port: u16) -> Vec<String> {
-    let Some(ip) = local_ip_address() else {
-        return Vec::new();
-    };
-    let parts = ip.split('.').collect::<Vec<_>>();
-    if parts.len() != 4 {
-        return Vec::new();
-    }
-    let self_host = parts[3].parse::<u8>().unwrap_or(0);
-    let subnet_prefix = format!("{}.{}.{}", parts[0], parts[1], parts[2]);
+    unicast_sweep_targets_for_ips(port, &local_ipv4_addresses())
+}
+
+fn unicast_sweep_targets_for_ips(port: u16, local_ips: &[Ipv4Addr]) -> Vec<String> {
     let ports = discovery_target_ports(port);
-    (1..=254u8)
-        .filter(|host| *host != self_host)
-        .flat_map(|host| {
-            let subnet_prefix = subnet_prefix.clone();
-            ports
-                .iter()
-                .map(move |port| format!("{subnet_prefix}.{host}:{port}"))
-        })
-        .collect()
+    let mut targets = Vec::new();
+
+    for ip in local_ips {
+        let [a, b, c, self_host] = ip.octets();
+        let subnet_prefix = format!("{a}.{b}.{c}");
+        targets.extend(
+            (1..=254u8)
+                .filter(|host| *host != self_host)
+                .flat_map(|host| {
+                    let subnet_prefix = subnet_prefix.clone();
+                    ports
+                        .iter()
+                        .map(move |port| format!("{subnet_prefix}.{host}:{port}"))
+                }),
+        );
+    }
+
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 /// Adds (once per process) an inbound UDP allow rule for this binary to Windows
@@ -7858,6 +7911,70 @@ mod tests {
     }
 
     #[test]
+    fn pairing_confirm_stream_rejects_wrong_code() {
+        let mut layout = test_layout();
+        layout.machine_role = "client".into();
+        layout.paired_controllers.clear();
+
+        let mut server = test_peer();
+        server.id = "server-10-0-0-1".into();
+        server.name = "Server".into();
+        server.machine_role = "server".into();
+        server.ip = "10.0.0.1".into();
+        server.transport_public_key = "server-public-key".into();
+
+        let layout_state = Arc::new(Mutex::new(layout));
+        let pairing_challenge = Arc::new(Mutex::new(Some(PairingChallenge {
+            code: "123456".into(),
+            requester_id: server.id.clone(),
+            requester_name: server.name.clone(),
+            requester_ip: server.ip.clone(),
+            requester_host: server.host.clone(),
+            requester_public_key: server.transport_public_key.clone(),
+            requester_protocol_version: server.protocol_version,
+            expires_at: Instant::now() + Duration::from_secs(60),
+            expires_at_ms: now_ms() + 60_000,
+            attempts: 0,
+        })));
+        let config_path =
+            std::env::temp_dir().join(format!("mykvm-pairing-reject-test-{}.json", now_ms()));
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let payload = encode_discovery_payload(
+            "pair-confirm",
+            &server,
+            DiscoveryPairingFields {
+                code: Some("000000".into()),
+                cluster_id: Some("server-cluster".into()),
+                secret: Some("server-secret".into()),
+                error: None,
+            },
+        )
+        .expect("pair-confirm should encode");
+
+        assert!(!handle_pairing_stream_packet(
+            &payload,
+            SocketAddr::from(([10, 0, 0, 1], 52001)),
+            &layout_state,
+            &pairing_challenge,
+            &config_path,
+            &peers,
+        ));
+
+        let saved = layout_state.lock().expect("layout lock").clone();
+        assert!(saved.paired_controllers.is_empty());
+        assert_eq!(
+            pairing_challenge
+                .lock()
+                .expect("challenge lock")
+                .as_ref()
+                .expect("challenge still active")
+                .attempts,
+            1
+        );
+        let _ = fs::remove_file(config_path);
+    }
+
+    #[test]
     fn clipboard_packet_requires_paired_controller_on_client() {
         let mut layout = test_layout();
         layout.machine_role = "client".into();
@@ -8407,6 +8524,32 @@ mod tests {
         let addrs = broadcast_addrs(DISCOVERY_PORT);
         assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
         assert!(addrs.contains(&format!("255.255.255.255:{}", DISCOVERY_PORT + 1)));
+    }
+
+    #[test]
+    fn broadcast_addrs_include_every_local_ipv4_subnet() {
+        let addrs = broadcast_addrs_for_ips(
+            DISCOVERY_PORT,
+            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
+        );
+
+        assert!(addrs.contains(&format!("255.255.255.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("192.168.66.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("10.0.0.255:{DISCOVERY_PORT}")));
+        assert!(addrs.contains(&format!("192.168.66.255:{}", DISCOVERY_PORT + 1)));
+    }
+
+    #[test]
+    fn unicast_sweep_targets_cover_every_local_ipv4_subnet() {
+        let targets = unicast_sweep_targets_for_ips(
+            DISCOVERY_PORT,
+            &[Ipv4Addr::new(192, 168, 66, 106), Ipv4Addr::new(10, 0, 0, 4)],
+        );
+
+        assert!(targets.contains(&format!("192.168.66.92:{DISCOVERY_PORT}")));
+        assert!(targets.contains(&format!("10.0.0.1:{DISCOVERY_PORT}")));
+        assert!(!targets.contains(&format!("192.168.66.106:{DISCOVERY_PORT}")));
+        assert!(!targets.contains(&format!("10.0.0.4:{DISCOVERY_PORT}")));
     }
 
     #[test]

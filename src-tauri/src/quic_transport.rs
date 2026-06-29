@@ -80,10 +80,6 @@ impl TransportHandle {
             .map_err(|_| "QUIC transport is stopped".to_string())
     }
 
-    pub fn send_stream(&self, peer: PeerEndpoint, payload: Vec<u8>) -> Result<(), String> {
-        self.send_stream_inner(peer, payload, false)
-    }
-
     pub fn send_stream_expect_ack(
         &self,
         peer: PeerEndpoint,
